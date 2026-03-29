@@ -2,21 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from appsec_agent.agents.coding import coding_agent
-from appsec_agent.agents.planning import planning_agent
-from appsec_agent.agents.security import security_agent
 from appsec_agent.core.config import AppConfig
 from appsec_agent.core.models import (
     AgentTraceEntry,
     AnalysisRequest,
     AnalysisResponse,
-    FindingCandidate,
-    PlanningResult,
-    SecurityAssessment,
 )
+from appsec_agent.core.plugins import AgentRegistry, AgentSpec, ExecutionContext
 from appsec_agent.core.taxonomy import severity_for_issue
 from appsec_agent.memory.store import SQLiteFindingsRepository
-from appsec_agent.providers.base import ModelOutputError, ModelProvider, ProviderError
+from appsec_agent.providers.base import ModelProvider, ProviderError
 
 
 @dataclass(slots=True)
@@ -24,6 +19,7 @@ class AnalysisService:
     config: AppConfig
     provider: ModelProvider
     repository: SQLiteFindingsRepository
+    registry: AgentRegistry
 
     def analyze(self, request: AnalysisRequest) -> AnalysisResponse:
         response = AnalysisResponse(
@@ -38,40 +34,48 @@ class AnalysisService:
             return response
 
         history = self.repository.get_developer_history(request.developer_id)
+        context = ExecutionContext(
+            config=self.config,
+            request=request,
+            response=response,
+            provider=self.provider,
+            repository=self.repository,
+            history=history,
+        )
 
-        planning = self._run_planning(request, history, response)
-        if planning is None:
+        if not self._run_pipeline(context):
             return response
 
-        finding = self._run_coding(request, planning, response)
-        if finding is None:
-            response.planning = planning.to_dict()
+        if context.planning is not None:
+            response.planning = context.planning.to_dict()
+
+        if context.finding is None:
+            response.status = "failed"
+            response.errors.append("Pipeline completed without a finding result.")
             return response
 
-        response.planning = planning.to_dict()
-        response.vuln_found = finding.vuln_found
-        response.vuln_type = finding.vuln_type
-        response.vulnerable_line = finding.vulnerable_line
-        response.attack_scenario = finding.attack_scenario
-        response.suggested_fix = finding.suggested_fix
-        response.confidence = finding.confidence
+        response.vuln_found = context.finding.vuln_found
+        response.vuln_type = context.finding.vuln_type
+        response.vulnerable_line = context.finding.vulnerable_line
+        response.attack_scenario = context.finding.attack_scenario
+        response.suggested_fix = context.finding.suggested_fix
+        response.confidence = context.finding.confidence
 
-        if not finding.vuln_found:
+        if not context.finding.vuln_found:
             response.full_explanation = "No vulnerability detected in this code snippet."
             response.developer_note = "No vulnerability found. Code looks clean."
             return response
 
-        security = self._run_security(request, finding, history, response)
-        if security is None:
-            response.severity = severity_for_issue(finding.vuln_type)
+        if context.security is None:
+            response.severity = severity_for_issue(context.finding.vuln_type)
             if response.status == "success":
                 response.status = "partial"
         else:
-            response.severity = security.severity
-            response.owasp_category = security.owasp_category
-            response.data_flow = security.data_flow
-            response.developer_note = security.developer_note
-            response.full_explanation = security.full_explanation
+            response.severity = context.security.severity
+            response.owasp_category = context.security.owasp_category
+            response.data_flow = context.security.data_flow
+            response.developer_note = context.security.developer_note
+            response.full_explanation = context.security.full_explanation
 
         try:
             self.repository.save_finding(
@@ -87,115 +91,56 @@ class AnalysisService:
 
         return response
 
-    def _run_planning(
-        self,
-        request: AnalysisRequest,
-        history: list,
-        response: AnalysisResponse,
-    ) -> PlanningResult | None:
+    def _run_pipeline(self, context: ExecutionContext) -> bool:
+        for spec in self.registry.get_enabled_agents(self.config):
+            should_continue = self._run_agent(spec, context)
+            if not should_continue:
+                return False
+        return True
+
+    def _run_agent(self, spec: AgentSpec, context: ExecutionContext) -> bool:
+        model_name = context.model_for(spec)
         try:
-            planning = planning_agent(
-                provider=self.provider,
-                model=self.config.model_planning,
-                code=request.code,
-                developer_history=[finding.to_dict() for finding in history],
-                mode=request.mode,
-            )
+            spec.runner(context)
         except ProviderError as exc:
-            response.status = "failed"
-            response.errors.append(str(exc))
-            response.agent_trace.append(
-                AgentTraceEntry(
-                    name="planning",
-                    stage="planning",
-                    status="failed",
-                    model=self.config.model_planning,
-                    error=str(exc),
-                )
-            )
-            return None
+            self._record_failure(spec, context.response, model_name, str(exc), required=spec.required)
+            return False if spec.required else True
+        except Exception as exc:
+            self._record_failure(spec, context.response, model_name, str(exc), required=spec.required)
+            return False if spec.required else True
 
-        response.agent_trace.append(
+        context.response.agent_trace.append(
             AgentTraceEntry(
-                name="planning",
-                stage="planning",
+                name=spec.name,
+                stage=spec.stage,
                 status="success",
-                model=self.config.model_planning,
+                model=model_name,
             )
         )
-        return planning
+        return True
 
-    def _run_coding(
+    def _record_failure(
         self,
-        request: AnalysisRequest,
-        planning: PlanningResult,
+        spec: AgentSpec,
         response: AnalysisResponse,
-    ) -> FindingCandidate | None:
-        try:
-            finding = coding_agent(
-                provider=self.provider,
-                model=self.config.model_coding,
-                code=request.code,
-                planning_result=planning,
-            )
-        except ProviderError as exc:
+        model_name: str,
+        error: str,
+        *,
+        required: bool,
+    ) -> None:
+        if required:
             response.status = "failed"
-            response.errors.append(str(exc))
-            response.agent_trace.append(
-                AgentTraceEntry(
-                    name="coding",
-                    stage="coding",
-                    status="failed",
-                    model=self.config.model_coding,
-                    error=str(exc),
-                )
-            )
-            return None
-
+            response.errors.append(error)
+        else:
+            response.warnings.append(error)
+            if response.status == "success":
+                response.status = "partial"
         response.agent_trace.append(
             AgentTraceEntry(
-                name="coding",
-                stage="coding",
-                status="success",
-                model=self.config.model_coding,
+                name=spec.name,
+                stage=spec.stage,
+                status="failed",
+                model=model_name,
+                error=error,
             )
         )
-        return finding
-
-    def _run_security(
-        self,
-        request: AnalysisRequest,
-        finding: FindingCandidate,
-        history: list,
-        response: AnalysisResponse,
-    ) -> SecurityAssessment | None:
-        try:
-            security = security_agent(
-                provider=self.provider,
-                model=self.config.model_security,
-                code=request.code,
-                coding_result=finding,
-                developer_history=[finding_item.to_dict() for finding_item in history],
-            )
-        except (ModelOutputError, ProviderError) as exc:
-            response.warnings.append(str(exc))
-            response.agent_trace.append(
-                AgentTraceEntry(
-                    name="security",
-                    stage="security",
-                    status="failed",
-                    model=self.config.model_security,
-                    error=str(exc),
-                )
-            )
-            return None
-
-        response.agent_trace.append(
-            AgentTraceEntry(
-                name="security",
-                stage="security",
-                status="success",
-                model=self.config.model_security,
-            )
-        )
-        return security

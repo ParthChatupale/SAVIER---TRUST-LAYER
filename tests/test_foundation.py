@@ -5,8 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from appsec_agent.agents.registry import register_default_agents
 from appsec_agent.core.config import AppConfig
 from appsec_agent.core.models import AnalysisRequest, FindingCandidate
+from appsec_agent.core.plugins import AgentRegistry, AgentSpec
 from appsec_agent.core.taxonomy import normalize_vulnerability_type
 from appsec_agent.http_server import create_app
 from appsec_agent.memory.store import SQLiteFindingsRepository
@@ -35,7 +37,8 @@ def build_service(
     repository = SQLiteFindingsRepository(config.db_path)
     repository.initialize()
     provider = FakeProvider(responses=responses, errors=errors)
-    return AnalysisService(config=config, provider=provider, repository=repository), repository
+    registry = register_default_agents(AgentRegistry())
+    return AnalysisService(config=config, provider=provider, repository=repository, registry=registry), repository
 
 
 class RepositoryTests(unittest.TestCase):
@@ -62,6 +65,79 @@ class ModelValidationTests(unittest.TestCase):
             "SQL Injection",
             normalize_vulnerability_type("SQL injection vulnerability"),
         )
+
+
+class RegistryTests(unittest.TestCase):
+    def test_registry_rejects_duplicate_agents(self):
+        registry = AgentRegistry()
+        spec = AgentSpec(
+            name="planning",
+            stage="planning",
+            order=10,
+            description="test",
+            input_type=str,
+            output_type=dict,
+            model_config_key="model_planning",
+            runner=lambda context: None,
+        )
+        registry.register_agent(spec)
+        with self.assertRaises(ValueError):
+            registry.register_agent(spec)
+
+    def test_registry_rejects_invalid_stage_or_order(self):
+        with self.assertRaises(ValueError):
+            AgentSpec(
+                name="bad-stage",
+                stage="",
+                order=10,
+                description="test",
+                input_type=str,
+                output_type=dict,
+                model_config_key="model_planning",
+                runner=lambda context: None,
+            )
+        with self.assertRaises(ValueError):
+            AgentSpec(
+                name="bad-order",
+                stage="planning",
+                order=-1,
+                description="test",
+                input_type=str,
+                output_type=dict,
+                model_config_key="model_planning",
+                runner=lambda context: None,
+            )
+
+    def test_registry_skips_disabled_agents(self):
+        registry = AgentRegistry()
+        registry.register_agent(
+            AgentSpec(
+                name="planning",
+                stage="planning",
+                order=10,
+                description="test",
+                input_type=str,
+                output_type=dict,
+                model_config_key="model_planning",
+                runner=lambda context: None,
+            )
+        )
+        registry.register_agent(
+            AgentSpec(
+                name="security",
+                stage="security",
+                order=30,
+                description="test",
+                input_type=dict,
+                output_type=dict,
+                model_config_key="model_security",
+                runner=lambda context: None,
+                enabled=False,
+            )
+        )
+        config = AppConfig(db_path=Path("memory.db"), enabled_agents=("planning", "security"))
+        enabled = registry.get_enabled_agents(config)
+        self.assertEqual(["planning"], [spec.name for spec in enabled])
 
 
 class AnalysisServiceTests(unittest.TestCase):
@@ -138,6 +214,65 @@ class AnalysisServiceTests(unittest.TestCase):
             result = service.analyze(AnalysisRequest(code="query = ...", developer_id="alice"))
             self.assertEqual("success", result.status)
             self.assertEqual(1, len(repo.get_developer_history("alice")))
+
+    def test_custom_registered_agent_runs_without_service_changes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = AppConfig(
+                db_path=Path(tmpdir) / "memory.db",
+                enabled_agents=("planning", "coding", "security", "annotate"),
+            )
+            repository = SQLiteFindingsRepository(config.db_path)
+            repository.initialize()
+            provider = FakeProvider(
+                responses={
+                    "planning": {
+                        "intent": "Query user data.",
+                        "entry_points": ["user_id"],
+                        "sensitive_operations": ["db.execute"],
+                        "security_focus": ["SQL Injection"],
+                    },
+                    "coding": {
+                        "vuln_found": True,
+                        "vuln_type": "SQL Injection",
+                        "vulnerable_line": 'query = "SELECT * FROM users WHERE id=" + user_id',
+                        "pattern": "User input is concatenated into SQL.",
+                        "attack_scenario": "Attacker can inject SQL.",
+                        "suggested_fix": "Use parameterized queries.",
+                        "confidence": 0.9,
+                    },
+                    "security": {
+                        "severity": "CRITICAL",
+                        "owasp_category": "A03",
+                        "cve_reference": "GENERIC",
+                        "data_flow": "user input reaches db.execute",
+                        "developer_note": "Use bound parameters.",
+                        "full_explanation": "Concatenated SQL is injectable.",
+                    },
+                }
+            )
+            registry = register_default_agents(AgentRegistry())
+            registry.register_agent(
+                AgentSpec(
+                    name="annotate",
+                    stage="postprocess",
+                    order=40,
+                    description="Add an internal annotation.",
+                    input_type=dict,
+                    output_type=dict,
+                    model_config_key="model_security",
+                    runner=lambda context: context.response.warnings.append("annotated"),
+                    required=False,
+                )
+            )
+            service = AnalysisService(
+                config=config,
+                provider=provider,
+                repository=repository,
+                registry=registry,
+            )
+            result = service.analyze(AnalysisRequest(code="query = ...", developer_id="alice"))
+            self.assertEqual("success", result.status)
+            self.assertIn("annotated", result.warnings)
 
 
 class TransportTests(unittest.TestCase):

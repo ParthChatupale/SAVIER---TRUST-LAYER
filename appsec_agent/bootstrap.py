@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from appsec_agent.agents.registry import register_default_agents
 from appsec_agent.core.config import AppConfig, load_config
+from appsec_agent.core.plugins import AgentRegistry
 from appsec_agent.memory.store import SQLiteFindingsRepository
 from appsec_agent.providers.ollama import OllamaProvider
 from appsec_agent.services.analysis import AnalysisService
@@ -22,8 +24,14 @@ def get_repository() -> SQLiteFindingsRepository:
 
 
 @lru_cache(maxsize=1)
+def get_agent_registry() -> AgentRegistry:
+    return register_default_agents(AgentRegistry())
+
+
+@lru_cache(maxsize=1)
 def get_analysis_service() -> AnalysisService:
     config = get_app_config()
     repository = get_repository()
     provider = OllamaProvider(config)
-    return AnalysisService(config=config, provider=provider, repository=repository)
+    registry = get_agent_registry()
+    return AnalysisService(config=config, provider=provider, repository=repository, registry=registry)
