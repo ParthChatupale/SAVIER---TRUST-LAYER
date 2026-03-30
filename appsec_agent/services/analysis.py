@@ -100,6 +100,16 @@ class AnalysisService:
 
     def _run_agent(self, spec: AgentSpec, context: ExecutionContext) -> bool:
         model_name = context.model_for(spec)
+        if spec.should_run is not None and not spec.should_run(context):
+            context.response.agent_trace.append(
+                AgentTraceEntry(
+                    name=spec.name,
+                    stage=spec.stage,
+                    status="skipped",
+                    model=model_name,
+                )
+            )
+            return True
         try:
             spec.runner(context)
         except ProviderError as exc:

@@ -7,14 +7,20 @@ from pathlib import Path
 
 from appsec_agent.agents.registry import register_default_agents
 from appsec_agent.core.config import AppConfig
-from appsec_agent.core.models import AnalysisRequest, FindingCandidate
-from appsec_agent.core.plugins import AgentRegistry, AgentSpec
-from appsec_agent.core.taxonomy import normalize_vulnerability_type
+from appsec_agent.core.models import AnalysisRequest, FindingCandidate, PlanningResult, SecurityAssessment
+from appsec_agent.core.plugins import AgentRegistry, AgentSpec, ToolExecutionContext, ToolSpec
+from appsec_agent.core.taxonomy import (
+    normalize_owasp_category,
+    normalize_severity,
+    normalize_suggested_fix,
+    normalize_vulnerability_type,
+)
 from appsec_agent.http_server import create_app
 from appsec_agent.memory.store import SQLiteFindingsRepository
 from appsec_agent.providers.base import ModelOutputError, ProviderUnavailableError
-from appsec_agent.server import call_tool
+from appsec_agent.server import call_tool, list_tools
 from appsec_agent.services.analysis import AnalysisService
+from appsec_agent.tools.registry import register_default_tools
 
 
 class FakeProvider:
@@ -65,6 +71,92 @@ class ModelValidationTests(unittest.TestCase):
             "SQL Injection",
             normalize_vulnerability_type("SQL injection vulnerability"),
         )
+
+    def test_parenthetical_issue_suffix_is_normalized(self):
+        self.assertEqual(
+            "SQL Injection",
+            normalize_vulnerability_type("SQL injection (potential)"),
+        )
+
+    def test_severity_is_normalized_to_canonical_uppercase(self):
+        self.assertEqual("HIGH", normalize_severity("High", vuln_type="Hardcoded Secret"))
+
+    def test_owasp_category_prefers_canonical_mapping_for_issue_type(self):
+        self.assertEqual(
+            "A03:2021 - Injection",
+            normalize_owasp_category("A05:2017 - Injection", vuln_type="SQL Injection"),
+        )
+
+    def test_planning_result_rejects_generic_mode_as_intent(self):
+        planning = PlanningResult.from_payload(
+            {
+                "intent": "security",
+                "entry_points": [],
+                "sensitive_operations": [],
+                "security_focus": [],
+            },
+            "security",
+            code="def get_user(user_id):\n    return db.execute(user_id)\n",
+        )
+        self.assertNotEqual("security", planning.intent)
+        self.assertIn("get_user", planning.intent)
+
+    def test_planning_result_derives_entry_points_and_operations_from_code(self):
+        planning = PlanningResult.from_payload(
+            {
+                "intent": "security review",
+                "entry_points": ["function definitions"],
+                "sensitive_operations": ["SQL injection (potentially vulnerable)"],
+                "security_focus": ["SQL Injection"],
+            },
+            "security",
+            code=(
+                "def get_user(user_id, tenant_id):\n"
+                "    query = 'SELECT * FROM users WHERE id=' + user_id\n"
+                "    return db.execute(query)\n"
+            ),
+        )
+        self.assertEqual(["user_id", "tenant_id"], planning.entry_points)
+        self.assertEqual(["db.execute(...)"], planning.sensitive_operations)
+
+    def test_security_assessment_normalizes_severity_and_owasp(self):
+        assessment = SecurityAssessment.from_payload(
+            {
+                "severity": "High",
+                "owasp_category": "A05:2017 - Injection",
+                "cve_reference": "GENERIC",
+                "data_flow": "user input reaches SQL",
+                "developer_note": "Use parameters",
+                "full_explanation": "SQL is injectable",
+            },
+            vuln_type="SQL Injection",
+        )
+        self.assertEqual("CRITICAL", assessment.severity)
+        self.assertEqual("A03:2021 - Injection", assessment.owasp_category)
+
+    def test_suggested_fix_is_canonicalized_for_known_issue_type(self):
+        fix = normalize_suggested_fix(
+            "Use parameterized queries or prepared statements to separate user input from SQL code.",
+            vuln_type="SQL Injection",
+            vulnerable_line='query = "SELECT * FROM users WHERE id=" + user_id',
+        )
+        self.assertIn("parameterized query", fix.lower())
+        self.assertIn("db.execute(query, (user_id,))", fix)
+
+    def test_finding_candidate_rewrites_weak_sql_fix(self):
+        finding = FindingCandidate.from_payload(
+            {
+                "vuln_found": True,
+                "vuln_type": "SQL injection (potential)",
+                "vulnerable_line": 'query = "SELECT * FROM users WHERE id=" + user_id',
+                "pattern": "User input is concatenated into SQL.",
+                "attack_scenario": "Attacker can inject SQL.",
+                "suggested_fix": "Use parameterized queries or prepared statements to separate user input from SQL code.",
+                "confidence": 0.8,
+            }
+        )
+        self.assertEqual("SQL Injection", finding.vuln_type)
+        self.assertIn("db.execute(query, (user_id,))", finding.suggested_fix)
 
 
 class RegistryTests(unittest.TestCase):
@@ -139,6 +231,18 @@ class RegistryTests(unittest.TestCase):
         enabled = registry.get_enabled_agents(config)
         self.assertEqual(["planning"], [spec.name for spec in enabled])
 
+    def test_registry_rejects_duplicate_tools(self):
+        registry = AgentRegistry()
+        spec = ToolSpec(
+            name="analyze_code",
+            description="Analyze code",
+            input_schema={"type": "object", "properties": {}, "required": []},
+            handler=lambda context, arguments: {"ok": True},
+        )
+        registry.register_tool(spec)
+        with self.assertRaises(ValueError):
+            registry.register_tool(spec)
+
 
 class AnalysisServiceTests(unittest.TestCase):
     def test_provider_unavailable_marks_analysis_failed(self):
@@ -158,7 +262,7 @@ class AnalysisServiceTests(unittest.TestCase):
                 Path(tmpdir),
                 responses={
                     "planning": {
-                        "intent": "Query user data.",
+                        "intent": "security",
                         "entry_points": ["user_id"],
                         "sensitive_operations": ["db.execute"],
                         "security_focus": ["SQL Injection"],
@@ -202,8 +306,8 @@ class AnalysisServiceTests(unittest.TestCase):
                         "confidence": 0.92,
                     },
                     "security": {
-                        "severity": "CRITICAL",
-                        "owasp_category": "A03:2021 - Injection",
+                        "severity": "High",
+                        "owasp_category": "A05:2017 - Injection",
                         "cve_reference": "GENERIC",
                         "data_flow": "user input flows into db.execute",
                         "developer_note": "Use bound parameters.",
@@ -213,7 +317,39 @@ class AnalysisServiceTests(unittest.TestCase):
             )
             result = service.analyze(AnalysisRequest(code="query = ...", developer_id="alice"))
             self.assertEqual("success", result.status)
+            self.assertEqual("CRITICAL", result.severity)
+            self.assertEqual("A03:2021 - Injection", result.owasp_category)
+            self.assertNotEqual("security", result.planning["intent"])
             self.assertEqual(1, len(repo.get_developer_history("alice")))
+
+    def test_security_agent_is_skipped_when_no_finding_exists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service, _ = build_service(
+                Path(tmpdir),
+                responses={
+                    "planning": {
+                        "intent": "Add numbers.",
+                        "entry_points": [],
+                        "sensitive_operations": [],
+                        "security_focus": [],
+                    },
+                    "coding": {
+                        "vuln_found": False,
+                        "vuln_type": "",
+                        "vulnerable_line": "",
+                        "pattern": "",
+                        "attack_scenario": "",
+                        "suggested_fix": "",
+                        "confidence": 0.0,
+                    },
+                },
+            )
+            result = service.analyze(AnalysisRequest(code="return a + b", developer_id="alice"))
+            self.assertEqual("success", result.status)
+            self.assertEqual(
+                "skipped",
+                next(entry.status for entry in result.agent_trace if entry.name == "security"),
+            )
 
     def test_custom_registered_agent_runs_without_service_changes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -260,7 +396,11 @@ class AnalysisServiceTests(unittest.TestCase):
                     input_type=dict,
                     output_type=dict,
                     model_config_key="model_security",
-                    runner=lambda context: context.response.warnings.append("annotated"),
+                    artifact_key="annotate",
+                    runner=lambda context: (
+                        context.set_artifact("annotate", {"note": "annotated"}),
+                        context.response.warnings.append("annotated"),
+                    ),
                     required=False,
                 )
             )
@@ -276,6 +416,39 @@ class AnalysisServiceTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_http_invalid_mode_returns_normalized_failure_response(self):
+        app = create_app()
+        app.config["TESTING"] = True
+        client = app.test_client()
+
+        response = client.post(
+            "/analyze",
+            json={"code": "print(1)", "developer_id": "alice", "mode": "banana"},
+        )
+        payload = response.get_json()
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("failed", payload["status"])
+        self.assertIn("Unsupported analysis mode", payload["errors"][0])
+
+    def test_http_and_mcp_share_failed_response_shape_for_invalid_mode(self):
+        app = create_app()
+        app.config["TESTING"] = True
+        client = app.test_client()
+        http_payload = client.post(
+            "/analyze",
+            json={"code": "print(1)", "developer_id": "alice", "mode": "banana"},
+        ).get_json()
+
+        async def invoke():
+            result = await call_tool(
+                "analyze_code",
+                {"code": "print(1)", "developer_id": "alice", "mode": "banana"},
+            )
+            return json.loads(result[0].text)
+
+        mcp_payload = __import__("asyncio").run(invoke())
+        self.assertEqual(http_payload, mcp_payload)
+
     def test_http_clear_route_uses_fixed_schema(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             service, repo = build_service(
@@ -360,6 +533,61 @@ class TransportTests(unittest.TestCase):
             payload = __import__("asyncio").run(invoke())
             self.assertEqual("performance", payload["mode"])
             self.assertEqual("N+1 Query", payload["vuln_type"])
+
+    def test_mcp_unknown_tool_returns_registry_error_payload(self):
+        async def invoke():
+            result = await call_tool("does_not_exist", {})
+            return json.loads(result[0].text)
+
+        payload = __import__("asyncio").run(invoke())
+        self.assertEqual({"error": "Unknown tool: does_not_exist"}, payload)
+
+    def test_mcp_list_tools_reads_from_registered_tool_specs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service, repo = build_service(
+                Path(tmpdir),
+                responses={
+                    "planning": {
+                        "intent": "Clean code.",
+                        "entry_points": [],
+                        "sensitive_operations": [],
+                        "security_focus": [],
+                    },
+                    "coding": {
+                        "vuln_found": False,
+                        "vuln_type": "",
+                        "vulnerable_line": "",
+                        "pattern": "",
+                        "attack_scenario": "",
+                        "suggested_fix": "",
+                        "confidence": 0.0,
+                    },
+                },
+            )
+            import appsec_agent.server as mcp_server
+
+            registry = register_default_tools(register_default_agents(AgentRegistry()))
+            registry.register_tool(
+                ToolSpec(
+                    name="ping",
+                    description="Return a pong payload.",
+                    input_schema={"type": "object", "properties": {}, "required": []},
+                    handler=lambda context, arguments: {"pong": True},
+                    implementation_ref="tests.ping",
+                )
+            )
+
+            mcp_server.get_analysis_service = lambda: service
+            mcp_server.get_repository = lambda: repo
+            mcp_server.get_plugin_registry = lambda: registry
+
+            async def list_registered():
+                tools = await list_tools()
+                return sorted(tool.name for tool in tools)
+
+            names = __import__("asyncio").run(list_registered())
+            self.assertIn("ping", names)
+            self.assertIn("analyze_code", names)
 
 
 if __name__ == "__main__":

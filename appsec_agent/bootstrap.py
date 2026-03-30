@@ -8,6 +8,7 @@ from appsec_agent.core.plugins import AgentRegistry
 from appsec_agent.memory.store import SQLiteFindingsRepository
 from appsec_agent.providers.ollama import OllamaProvider
 from appsec_agent.services.analysis import AnalysisService
+from appsec_agent.tools.registry import register_default_tools
 
 
 @lru_cache(maxsize=1)
@@ -24,8 +25,16 @@ def get_repository() -> SQLiteFindingsRepository:
 
 
 @lru_cache(maxsize=1)
+def get_plugin_registry() -> AgentRegistry:
+    registry = AgentRegistry()
+    register_default_agents(registry)
+    register_default_tools(registry)
+    return registry
+
+
+@lru_cache(maxsize=1)
 def get_agent_registry() -> AgentRegistry:
-    return register_default_agents(AgentRegistry())
+    return get_plugin_registry()
 
 
 @lru_cache(maxsize=1)
@@ -33,5 +42,5 @@ def get_analysis_service() -> AnalysisService:
     config = get_app_config()
     repository = get_repository()
     provider = OllamaProvider(config)
-    registry = get_agent_registry()
+    registry = get_plugin_registry()
     return AnalysisService(config=config, provider=provider, repository=repository, registry=registry)

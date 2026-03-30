@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from appsec_agent.core.models import FindingCandidate, PlanningResult
+from appsec_agent.core.plugins import AgentSpec, ExecutionContext
 from appsec_agent.providers.base import ModelOutputError, ModelProvider
 
 
@@ -59,3 +60,31 @@ Code:
         if not all(field.strip() for field in required_fields):
             raise ModelOutputError("coding stage returned an incomplete finding.")
     return finding
+
+
+def run_coding_agent(context: ExecutionContext) -> None:
+    planning_result = context.get_artifact("planning")
+    if planning_result is None:
+        raise ValueError("coding agent requires planning output.")
+    finding = coding_agent(
+        provider=context.provider,
+        model=context.config.model_coding,
+        code=context.request.code,
+        planning_result=planning_result,
+    )
+    context.set_artifact("coding", finding)
+
+
+def get_agent_spec() -> AgentSpec:
+    return AgentSpec(
+        name="coding",
+        stage="coding",
+        order=20,
+        description="Find the highest value code issue in the snippet.",
+        input_type=PlanningResult,
+        output_type=FindingCandidate,
+        model_config_key="model_coding",
+        artifact_key="coding",
+        runner=run_coding_agent,
+        required=True,
+    )

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from appsec_agent.bootstrap import get_analysis_service
-from appsec_agent.core.models import AnalysisRequest
+from appsec_agent.transports.common import parse_analysis_request, serialize_result
 
 
 def run_appsec_swarm(code: str, developer_id: str, mode: str = "security") -> dict:
     service = get_analysis_service()
-    request = AnalysisRequest(code=code, developer_id=developer_id, mode=mode)
-    return service.analyze(request).to_dict()
+    request, error_result = parse_analysis_request(
+        {"code": code, "developer_id": developer_id, "mode": mode}
+    )
+    if error_result is not None:
+        return serialize_result(error_result)
+    return serialize_result(service.analyze(request))
 
 
 def format_finding(result: dict) -> str:
