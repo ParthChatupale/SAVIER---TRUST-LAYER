@@ -1,0 +1,111 @@
+{
+  "name": "appsec-interceptor",
+  "displayName": "appsec-interceptor",
+  "description": "Premium VS Code client for Savier live trust analysis over the local appsec-agent service",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:appsec-interceptor.showHistory",
+    "onCommand:appsec-interceptor.showDashboard",
+    "onCommand:appsec-interceptor.showFileState",
+    "onCommand:appsec-interceptor.clearHistory",
+    "onCommand:appsec-interceptor.rerunAnalysis",
+    "onLanguage:python",
+    "onLanguage:javascript",
+    "onLanguage:typescript"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "appsec-interceptor.showHistory",
+        "title": "Savier: Show Developer History"
+      },
+      {
+        "command": "appsec-interceptor.showDashboard",
+        "title": "Savier: Show Trust Cockpit"
+      },
+      {
+        "command": "appsec-interceptor.showFileState",
+        "title": "Savier: Show Active File State"
+      },
+      {
+        "command": "appsec-interceptor.clearHistory",
+        "title": "Savier: Clear Developer History"
+      },
+      {
+        "command": "appsec-interceptor.rerunAnalysis",
+        "title": "Savier: Re-run Analysis for Active File"
+      }
+    ],
+    "configuration": {
+      "title": "AppSec Interceptor",
+      "properties": {
+        "appsecInterceptor.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:5000",
+          "description": "HTTP base URL for the local appsec-agent service."
+        },
+        "appsecInterceptor.developerId": {
+          "type": "string",
+          "default": "",
+          "description": "Developer identifier sent to the AppSec service. Falls back to the local username when empty."
+        },
+        "appsecInterceptor.mode": {
+          "type": "string",
+          "enum": ["security", "quality", "performance", "full"],
+          "default": "full",
+          "description": "Analysis mode to request from appsec-agent."
+        },
+        "appsecInterceptor.debounceMs": {
+          "type": "number",
+          "default": 1200,
+          "minimum": 100,
+          "description": "Delay after typing stops before auto-analysis starts."
+        },
+        "appsecInterceptor.requestTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 1000,
+          "description": "How long the extension waits for the AppSec service before marking the backend as unavailable."
+        },
+        "appsecInterceptor.enabledLanguages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": ["python", "javascript", "typescript"],
+          "description": "Language IDs that should be analyzed automatically."
+        },
+        "appsecInterceptor.autoAnalyze": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically analyze supported files on open and while editing."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "node ./out/test/runUnitTests.js"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "@types/vscode": "^1.110.0",
+    "@vscode/test-cli": "^0.0.11",
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^9.39.3",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.56.1"
+  }
+}
