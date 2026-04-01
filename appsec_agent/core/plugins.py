@@ -28,6 +28,8 @@ class AgentSpec:
     runner: AgentRunner
     artifact_key: str | None = None
     should_run: ShouldRunPredicate | None = None
+    parallel_group: str | None = None
+    review_dimension: str | None = None
     required: bool = True
     enabled: bool = True
     plugin_type: AllowedPluginType = "agent"
@@ -125,11 +127,38 @@ class ExecutionContext:
     def model_for(self, spec: AgentSpec) -> str:
         return getattr(self.config, spec.model_config_key)
 
+    def model_candidates_for(self, spec: AgentSpec) -> tuple[str, ...]:
+        primary = self.model_for(spec)
+        fallback_attr = spec.model_config_key.replace("model_", "model_fallback_", 1)
+        fallbacks = getattr(self.config, fallback_attr, ())
+        candidates = [primary]
+        for model_name in fallbacks:
+            if model_name and model_name not in candidates:
+                candidates.append(model_name)
+        return tuple(candidates)
+
     def set_artifact(self, key: str, value: Any) -> None:
         self.artifacts[key] = value
 
     def get_artifact(self, key: str, default: Any = None) -> Any:
         return self.artifacts.get(key, default)
+
+    def spawn_child(self) -> "ExecutionContext":
+        return ExecutionContext(
+            config=self.config,
+            request=self.request,
+            response=AnalysisResponse(
+                status=self.response.status,
+                developer_id=self.response.developer_id,
+                mode=self.response.mode,
+                file_uri=self.response.file_uri,
+            ),
+            provider=self.provider,
+            repository=self.repository,
+            history=self.history,
+            artifacts=dict(self.artifacts),
+            metadata={},
+        )
 
     @property
     def planning(self) -> "PlanningResult | None":
@@ -143,11 +172,11 @@ class ExecutionContext:
         self.set_artifact("planning", value)
 
     @property
-    def finding(self) -> "FindingCandidate | None":
+    def finding(self) -> "FindingCollection | None":
         return self.get_artifact("coding")
 
     @finding.setter
-    def finding(self, value: "FindingCandidate | None") -> None:
+    def finding(self, value: "FindingCollection | None") -> None:
         if value is None:
             self.artifacts.pop("coding", None)
             return
@@ -164,6 +193,17 @@ class ExecutionContext:
             return
         self.set_artifact("security", value)
 
+    @property
+    def aggregation(self) -> "AggregatedReviewResult | None":
+        return self.get_artifact("aggregation")
+
+    @aggregation.setter
+    def aggregation(self, value: "AggregatedReviewResult | None") -> None:
+        if value is None:
+            self.artifacts.pop("aggregation", None)
+            return
+        self.set_artifact("aggregation", value)
+
 
 @dataclass(slots=True)
 class ToolExecutionContext:
@@ -177,6 +217,8 @@ from appsec_agent.core.models import (  # noqa: E402
     AnalysisResponse,
     DeveloperFinding,
     FindingCandidate,
+    FindingCollection,
+    AggregatedReviewResult,
     PlanningResult,
     SecurityAssessment,
 )

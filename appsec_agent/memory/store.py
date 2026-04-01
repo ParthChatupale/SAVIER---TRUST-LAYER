@@ -44,6 +44,7 @@ class SQLiteFindingsRepository:
                     source TEXT NOT NULL,
                     mode TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
+                    analysis_profile TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     project_id TEXT,
                     overall_score INTEGER NOT NULL,
@@ -65,6 +66,7 @@ class SQLiteFindingsRepository:
                     developer_id TEXT NOT NULL,
                     file_uri TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
+                    analysis_profile TEXT NOT NULL DEFAULT '',
                     last_event_id TEXT,
                     source TEXT NOT NULL,
                     mode TEXT NOT NULL,
@@ -80,6 +82,8 @@ class SQLiteFindingsRepository:
                 )
                 """
             )
+            self._ensure_column(conn, "analysis_events", "analysis_profile", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "file_states", "analysis_profile", "TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
     def save_finding(self, developer: str, vuln_type: str, code_snippet: str, explanation: str) -> None:
@@ -173,6 +177,7 @@ class SQLiteFindingsRepository:
                     developer_id,
                     file_uri,
                     content_hash,
+                    analysis_profile,
                     last_event_id,
                     source,
                     mode,
@@ -185,9 +190,10 @@ class SQLiteFindingsRepository:
                     findings_json,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(developer_id, file_uri) DO UPDATE SET
                     content_hash = excluded.content_hash,
+                    analysis_profile = excluded.analysis_profile,
                     last_event_id = excluded.last_event_id,
                     source = excluded.source,
                     mode = excluded.mode,
@@ -204,6 +210,7 @@ class SQLiteFindingsRepository:
                     file_state.developer_id,
                     file_state.file_uri,
                     file_state.content_hash,
+                    file_state.analysis_profile,
                     file_state.last_event_id,
                     file_state.source,
                     file_state.mode,
@@ -229,6 +236,7 @@ class SQLiteFindingsRepository:
                     source,
                     mode,
                     content_hash,
+                    analysis_profile,
                     status,
                     project_id,
                     overall_score,
@@ -241,7 +249,7 @@ class SQLiteFindingsRepository:
                     findings_json,
                     summary_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.developer_id,
@@ -249,6 +257,7 @@ class SQLiteFindingsRepository:
                     event.source,
                     event.mode,
                     event.content_hash,
+                    event.analysis_profile,
                     event.status,
                     event.project_id,
                     event.scores.overall,
@@ -376,6 +385,7 @@ class SQLiteFindingsRepository:
             developer_id=str(row["developer_id"]),
             file_uri=str(row["file_uri"]),
             content_hash=str(row["content_hash"]),
+            analysis_profile=str(row["analysis_profile"] or ""),
             last_event_id=str(row["last_event_id"] or ""),
             source=str(row["source"] or ""),
             mode=str(row["mode"] or "security"),
@@ -402,6 +412,7 @@ class SQLiteFindingsRepository:
             source=str(row["source"] or ""),
             mode=str(row["mode"] or "security"),
             content_hash=str(row["content_hash"]),
+            analysis_profile=str(row["analysis_profile"] or ""),
             status=str(row["status"] or "success"),
             timestamp=str(row["timestamp"] or ""),
             project_id=str(row["project_id"] or ""),
@@ -420,6 +431,14 @@ class SQLiteFindingsRepository:
             ),
             summary=dict(summary_payload.get("summary", {})),
         )
+
+    def _ensure_column(self, conn: sqlite3.Connection, table_name: str, column_name: str, column_def: str) -> None:
+        existing = {
+            row[1]
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
 
 
 def get_repository(config: AppConfig | None = None) -> SQLiteFindingsRepository:

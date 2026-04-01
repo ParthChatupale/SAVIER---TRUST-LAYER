@@ -64,7 +64,7 @@ Code:
 def run_planning_agent(context: ExecutionContext) -> None:
     planning = planning_agent(
         provider=context.provider,
-        model=context.config.model_planning,
+        model=context.metadata.get("active_model", context.config.model_planning),
         code=context.request.code,
         developer_history=context.history_payload(),
         mode=context.request.mode,

@@ -6,6 +6,8 @@ from appsec_agent.agents.registry import register_default_agents
 from appsec_agent.core.config import AppConfig, load_config
 from appsec_agent.core.plugins import AgentRegistry
 from appsec_agent.memory.store import SQLiteFindingsRepository
+from appsec_agent.providers.base import ModelProvider, ProviderUnavailableError
+from appsec_agent.providers.nvidia import NvidiaProvider
 from appsec_agent.providers.ollama import OllamaProvider
 from appsec_agent.services.analysis import AnalysisService
 from appsec_agent.tools.registry import register_default_tools
@@ -41,6 +43,16 @@ def get_agent_registry() -> AgentRegistry:
 def get_analysis_service() -> AnalysisService:
     config = get_app_config()
     repository = get_repository()
-    provider = OllamaProvider(config)
+    provider = get_model_provider()
     registry = get_plugin_registry()
     return AnalysisService(config=config, provider=provider, repository=repository, registry=registry)
+
+
+@lru_cache(maxsize=1)
+def get_model_provider() -> ModelProvider:
+    config = get_app_config()
+    if config.provider_name == "nvidia":
+        return NvidiaProvider(config)
+    if config.provider_name == "ollama":
+        return OllamaProvider(config)
+    raise ProviderUnavailableError(f"unsupported provider: {config.provider_name}")

@@ -13,6 +13,7 @@ SEVERITY_MAP = {
     "Broken Authentication": "HIGH",
     "Sensitive Data Exposure": "MEDIUM",
     "Security Misconfiguration": "MEDIUM",
+    "Global State Misuse": "MEDIUM",
     "God Function": "MEDIUM",
     "Missing Error Handling": "MEDIUM",
     "No Input Validation": "HIGH",
@@ -20,6 +21,7 @@ SEVERITY_MAP = {
     "Missing Type Hints": "LOW",
     "N+1 Query": "HIGH",
     "Nested Loop": "MEDIUM",
+    "Unbounded Memory Growth": "HIGH",
     "Missing Cache": "MEDIUM",
     "Blocking IO": "HIGH",
     "Redundant Computation": "LOW",
@@ -36,12 +38,14 @@ DIMENSION_MAP = {
     "Sensitive Data Exposure": "security",
     "Security Misconfiguration": "security",
     "No Input Validation": "security",
+    "Global State Misuse": "quality",
     "God Function": "quality",
     "Missing Error Handling": "quality",
     "Magic Numbers": "quality",
     "Missing Type Hints": "quality",
     "N+1 Query": "performance",
     "Nested Loop": "performance",
+    "Unbounded Memory Growth": "performance",
     "Missing Cache": "performance",
     "Blocking IO": "performance",
     "Redundant Computation": "performance",
@@ -97,6 +101,9 @@ FIX_TEMPLATE_MAP = {
     "Security Misconfiguration": (
         "Apply secure defaults, remove unnecessary functionality, and explicitly configure the component for the intended security posture."
     ),
+    "Global State Misuse": (
+        "Remove shared mutable global state from the workflow. Pass state explicitly between functions or encapsulate it in a dedicated object."
+    ),
     "God Function": (
         "Split this function into smaller focused functions so each one has a single responsibility and clearer inputs and outputs."
     ),
@@ -118,6 +125,9 @@ FIX_TEMPLATE_MAP = {
     "Nested Loop": (
         "Reduce the nested-loop work by precomputing lookups, using a set or dict, or restructuring the algorithm to avoid O(n^2) behavior."
     ),
+    "Unbounded Memory Growth": (
+        "Avoid appending unbounded data to long-lived collections. Stream results, process in chunks, or clear state when it is no longer needed."
+    ),
     "Missing Cache": (
         "Cache repeated expensive reads or computations behind a clear invalidation strategy so identical requests do not recompute the same result."
     ),
@@ -135,14 +145,26 @@ _ALIASES = {
     "hardcoded api key": "Hardcoded Secret",
     "hard-coded secret": "Hardcoded Secret",
     "hardcoded secret": "Hardcoded Secret",
+    "hardcoded credentials": "Hardcoded Secret",
+    "hard-coded credentials": "Hardcoded Secret",
     "cross site scripting": "XSS",
     "cross-site scripting": "XSS",
     "xss vulnerability": "XSS",
+    "global variable misuse": "Global State Misuse",
+    "global state misuse": "Global State Misuse",
+    "shared mutable state": "Global State Misuse",
     "god method": "God Function",
     "god function": "God Function",
     "n+1 query problem": "N+1 Query",
     "n+1 queries": "N+1 Query",
     "nested loops": "Nested Loop",
+    "inefficient algorithm": "Nested Loop",
+    "inefficient sorting": "Nested Loop",
+    "quadratic algorithm": "Nested Loop",
+    "quadratic sorting": "Nested Loop",
+    "memory leak": "Unbounded Memory Growth",
+    "memory leak-like behavior": "Unbounded Memory Growth",
+    "unbounded memory growth": "Unbounded Memory Growth",
     "missing type hints": "Missing Type Hints",
 }
 
@@ -178,12 +200,18 @@ def normalize_vulnerability_type(raw_value: str) -> str:
 
     if "sql injection" in lowered:
         return "SQL Injection"
-    if "hardcoded secret" in lowered or "hard-coded secret" in lowered:
+    if "hardcoded secret" in lowered or "hard-coded secret" in lowered or "hardcoded credential" in lowered:
         return "Hardcoded Secret"
     if "path traversal" in lowered:
         return "Path Traversal"
     if "xss" in lowered or "cross site scripting" in lowered or "cross-site scripting" in lowered:
         return "XSS"
+    if "memory leak" in lowered:
+        return "Unbounded Memory Growth"
+    if "unbounded memory" in lowered:
+        return "Unbounded Memory Growth"
+    if "nested loop" in lowered or "inefficient algorithm" in lowered or "quadratic" in lowered:
+        return "Nested Loop"
 
     for alias, canonical in _ALIASES.items():
         if alias in lowered:
@@ -265,6 +293,18 @@ def dimension_for_issue(vuln_type: str, mode: str = "security") -> str:
     if mode in {"security", "quality", "performance"}:
         return mode
     return "security"
+
+
+def is_known_issue_type(vuln_type: str) -> bool:
+    canonical = normalize_vulnerability_type(vuln_type)
+    return canonical in DIMENSION_MAP
+
+
+def dimension_accepts_issue(dimension: str, vuln_type: str) -> bool:
+    canonical = normalize_vulnerability_type(vuln_type)
+    if canonical not in DIMENSION_MAP:
+        return False
+    return DIMENSION_MAP[canonical] == dimension
 
 
 def score_penalty_for_severity(severity: str) -> int:

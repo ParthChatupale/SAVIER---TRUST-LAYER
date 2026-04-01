@@ -4,15 +4,18 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from appsec_agent.agents.registry import register_default_agents
-from appsec_agent.core.config import AppConfig
+from appsec_agent.agents.review_common import run_dimension_review
+from appsec_agent.core.config import AppConfig, load_config
 from appsec_agent.core.models import (
     AnalysisEvent,
     AnalysisRequest,
     DimensionScores,
     FileState,
     FindingCandidate,
+    FindingCollection,
     FindingRecord,
     PlanningResult,
     ScoreDelta,
@@ -22,6 +25,7 @@ from appsec_agent.core.models import (
 )
 from appsec_agent.core.plugins import AgentRegistry, AgentSpec, ToolExecutionContext, ToolSpec
 from appsec_agent.core.taxonomy import (
+    dimension_accepts_issue,
     normalize_owasp_category,
     normalize_severity,
     normalize_suggested_fix,
@@ -30,9 +34,14 @@ from appsec_agent.core.taxonomy import (
 from appsec_agent.http_server import create_app
 from appsec_agent.memory.store import SQLiteFindingsRepository
 from appsec_agent.providers.base import ModelOutputError, ProviderUnavailableError
+from appsec_agent.providers.nvidia import NvidiaProvider
 from appsec_agent.server import call_tool, list_tools
 from appsec_agent.services.analysis import AnalysisService
 from appsec_agent.tools.registry import register_default_tools
+from appsec_agent.transports.common import (
+    analysis_input_schema,
+    parse_analysis_request,
+)
 
 
 class FakeProvider:
@@ -41,9 +50,17 @@ class FakeProvider:
         self.errors = errors or {}
 
     def generate_json(self, *, model: str, prompt: str, stage: str) -> dict:
-        if stage in self.errors:
-            raise self.errors[stage]
-        return self.responses[stage]
+        stage_aliases = [stage]
+        if stage in {"security_review", "quality_review", "performance_review"}:
+            stage_aliases.append("coding")
+        if stage == "aggregation":
+            stage_aliases.append("security")
+        for alias in stage_aliases:
+            if alias in self.errors:
+                raise self.errors[alias]
+            if alias in self.responses:
+                return self.responses[alias]
+        raise KeyError(stage)
 
 
 def build_service(
@@ -136,6 +153,58 @@ class RepositoryTests(unittest.TestCase):
             self.assertEqual([], repo.list_analysis_events("alice"))
 
 
+class ConfigAndProviderTests(unittest.TestCase):
+    def test_load_config_uses_nvidia_defaults_for_stage_models(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "APPSEC_AGENT_PROVIDER": "nvidia",
+                "NVIDIA_API_KEY": "test-key",
+            },
+            clear=False,
+        ):
+            config = load_config()
+        self.assertEqual("nvidia", config.provider_name)
+        self.assertEqual("google/gemma-2-9b-it", config.model_planning)
+        self.assertEqual("google/gemma-2-9b-it", config.model_coding)
+        self.assertEqual("openai/gpt-oss-120b", config.model_security)
+        self.assertEqual("google/gemma-2-9b-it", config.model_security_review)
+        self.assertEqual("google/gemma-2-9b-it", config.model_quality_review)
+        self.assertEqual("google/gemma-2-9b-it", config.model_performance_review)
+        self.assertEqual("openai/gpt-oss-120b", config.model_aggregation)
+        self.assertEqual("test-key", config.nvidia_api_key)
+
+    def test_nvidia_provider_parses_openai_compatible_json(self):
+        config = AppConfig(
+            provider_name="nvidia",
+            nvidia_api_key="test-key",
+            model_planning="google/gemma-2-9b-it",
+            model_coding="google/gemma-2-9b-it",
+            model_security="openai/gpt-oss-120b",
+        )
+        provider = NvidiaProvider(config)
+
+        class FakeMessage:
+            content = "```json\n" + json.dumps(
+                {
+                    "vuln_found": True,
+                    "vuln_type": "SQL Injection",
+                    "confidence": 0.9,
+                    "explanation": "Unsafe query building.",
+                }
+            ) + "\n```"
+
+        with patch.object(NvidiaProvider, "_client_for") as client_for:
+            client_for.return_value.invoke.return_value = FakeMessage()
+            payload = provider.generate_json(
+                model="google/gemma-2-9b-it",
+                prompt="return json",
+                stage="coding",
+            )
+        self.assertTrue(payload["vuln_found"])
+        self.assertEqual("SQL Injection", payload["vuln_type"])
+
+
 class ModelValidationTests(unittest.TestCase):
     def test_finding_candidate_requires_type_when_vuln_found(self):
         with self.assertRaises(ValueError):
@@ -146,12 +215,23 @@ class ModelValidationTests(unittest.TestCase):
             "SQL Injection",
             normalize_vulnerability_type("SQL injection vulnerability"),
         )
+        self.assertEqual(
+            "Global State Misuse",
+            normalize_vulnerability_type("global variable misuse"),
+        )
 
     def test_parenthetical_issue_suffix_is_normalized(self):
         self.assertEqual(
             "SQL Injection",
             normalize_vulnerability_type("SQL injection (potential)"),
         )
+
+    def test_new_aliases_are_normalized(self):
+        self.assertEqual("Nested Loop", normalize_vulnerability_type("inefficient algorithm"))
+        self.assertEqual("Unbounded Memory Growth", normalize_vulnerability_type("memory leak"))
+        self.assertEqual("Hardcoded Secret", normalize_vulnerability_type("hardcoded credentials"))
+        self.assertTrue(dimension_accepts_issue("performance", "Nested Loop"))
+        self.assertFalse(dimension_accepts_issue("quality", "Nested Loop"))
 
     def test_severity_is_normalized_to_canonical_uppercase(self):
         self.assertEqual("HIGH", normalize_severity("High", vuln_type="Hardcoded Secret"))
@@ -232,6 +312,136 @@ class ModelValidationTests(unittest.TestCase):
         )
         self.assertEqual("SQL Injection", finding.vuln_type)
         self.assertIn("db.execute(query, (user_id,))", finding.suggested_fix)
+
+    def test_finding_collection_accepts_multiple_findings(self):
+        collection = FindingCollection.from_payload(
+            {
+                "findings": [
+                    {
+                        "dimension": "security",
+                        "vuln_found": True,
+                        "vuln_type": "SQL injection vulnerability",
+                        "vulnerable_line": 'query = "SELECT * FROM users WHERE id = " + user_id',
+                        "pattern": "Unsafe SQL concatenation.",
+                        "attack_scenario": "Attacker injects SQL.",
+                        "suggested_fix": "Use parameters.",
+                        "confidence": 0.9,
+                    },
+                    {
+                        "dimension": "performance",
+                        "vuln_found": True,
+                        "vuln_type": "Nested loops",
+                        "vulnerable_line": "for i in range(len(numbers)):",
+                        "pattern": "O(n^2) sort implementation.",
+                        "attack_scenario": "Large input causes slow response.",
+                        "suggested_fix": "Use sort().",
+                        "confidence": 0.8,
+                    },
+                ]
+            },
+            mode="full",
+        )
+        self.assertEqual(2, len(collection.findings))
+        self.assertEqual("SQL Injection", collection.primary_finding().vuln_type)
+
+    def test_finding_collection_dedupes_semantic_duplicates(self):
+        collection = FindingCollection.from_payload(
+            {
+                "findings": [
+                    {
+                        "dimension": "performance",
+                        "vuln_found": True,
+                        "vuln_type": "Nested Loop",
+                        "vulnerable_line": "for i in range(len(numbers)):",
+                        "pattern": "Nested loops create O(n^2) work.",
+                        "attack_scenario": "Large input slows down.",
+                        "suggested_fix": "Use sorted().",
+                        "confidence": 0.9,
+                    },
+                    {
+                        "dimension": "performance",
+                        "vuln_found": True,
+                        "vuln_type": "inefficient algorithm",
+                        "vulnerable_line": "41",
+                        "pattern": "nested loops for sorting",
+                        "attack_scenario": "Large input slows down.",
+                        "suggested_fix": "Use sorted().",
+                        "confidence": 0.8,
+                    },
+                ]
+            },
+            mode="full",
+        )
+        self.assertEqual(1, len(collection.findings))
+        self.assertEqual("Nested Loop", collection.findings[0].vuln_type)
+
+    def test_dimension_review_filters_cross_dimension_and_unjustified_findings(self):
+        provider = FakeProvider(
+            responses={
+                "quality_review": {
+                    "findings": [
+                        {
+                            "dimension": "security",
+                            "vuln_found": True,
+                            "vuln_type": "SQL Injection",
+                            "vulnerable_line": "query = f\"SELECT * FROM users WHERE username = '{username}'\"",
+                            "pattern": "Unsafe SQL string interpolation.",
+                            "attack_scenario": "Attacker injects SQL.",
+                            "suggested_fix": "Use parameters.",
+                            "confidence": 0.95,
+                        },
+                        {
+                            "dimension": "security",
+                            "vuln_found": True,
+                            "vuln_type": "Hardcoded Credentials",
+                            "vulnerable_line": 'return sqlite3.connect("users.db")',
+                            "pattern": 'sqlite3.connect("users.db")',
+                            "attack_scenario": "Credentials are exposed.",
+                            "suggested_fix": "Move credentials to env.",
+                            "confidence": 0.8,
+                        },
+                    ]
+                }
+            }
+        )
+        result = run_dimension_review(
+            provider=provider,
+            model="fake",
+            code=(
+                "import sqlite3\n"
+                "# Global variable misuse\n"
+                "data = []\n"
+                "def connect_db():\n"
+                "    return sqlite3.connect(\"users.db\")\n"
+                "def process_data():\n"
+                "    global data\n"
+                "    data.append(1)\n"
+            ),
+            planning_result=PlanningResult(intent="demo", mode="quality"),
+            dimension="quality",
+        )
+        issue_types = {finding.vuln_type for finding in result.findings}
+        self.assertEqual({"Global State Misuse"}, issue_types)
+        self.assertTrue(all(finding.dimension == "quality" for finding in result.findings))
+
+    def test_quality_review_only_flags_god_function_for_large_function_block(self):
+        provider = FakeProvider(responses={"quality_review": {"findings": []}})
+        result = run_dimension_review(
+            provider=provider,
+            model="fake",
+            code=(
+                "def connect_db():\n"
+                "    return sqlite3.connect('users.db')\n\n"
+                "def main():\n"
+                "    username = input('u: ')\n"
+                "    password = input('p: ')\n"
+                "    if username:\n"
+                "        print(username)\n"
+            ),
+            planning_result=PlanningResult(intent="demo", mode="quality"),
+            dimension="quality",
+        )
+        self.assertNotIn("God Function", {finding.vuln_type for finding in result.findings})
 
     def test_score_penalties_and_diffs_are_deterministic(self):
         findings = [
@@ -358,7 +568,7 @@ class AnalysisServiceTests(unittest.TestCase):
             self.assertFalse(result.vuln_found)
             self.assertTrue(result.errors)
 
-    def test_security_failure_returns_partial_with_fallback_severity(self):
+    def test_aggregation_explainer_failure_falls_back_to_deterministic_primary_finding(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             service, _ = build_service(
                 Path(tmpdir),
@@ -381,11 +591,17 @@ class AnalysisServiceTests(unittest.TestCase):
                 },
                 errors={"security": ModelOutputError("security stage returned invalid JSON")},
             )
-            result = service.analyze(AnalysisRequest(code="query = ...", developer_id="alice"))
-            self.assertEqual("partial", result.status)
+            result = service.analyze(
+                AnalysisRequest(
+                    code='query = "SELECT * FROM users WHERE id=" + user_id\ncursor.execute(query)\n',
+                    developer_id="alice",
+                )
+            )
+            self.assertEqual("success", result.status)
             self.assertTrue(result.vuln_found)
             self.assertEqual("SQL Injection", result.vuln_type)
             self.assertEqual("CRITICAL", result.severity)
+            self.assertTrue(result.warnings)
 
     def test_successful_analysis_is_saved_to_history(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -417,14 +633,19 @@ class AnalysisServiceTests(unittest.TestCase):
                     },
                 },
             )
-            result = service.analyze(AnalysisRequest(code="query = ...", developer_id="alice"))
+            result = service.analyze(
+                AnalysisRequest(
+                    code='query = "SELECT * FROM users WHERE id=" + user_id\ncursor.execute(query)\n',
+                    developer_id="alice",
+                )
+            )
             self.assertEqual("success", result.status)
             self.assertEqual("CRITICAL", result.severity)
             self.assertEqual("A03:2021 - Injection", result.owasp_category)
             self.assertNotEqual("security", result.planning["intent"])
             self.assertEqual(1, len(repo.get_developer_history("alice")))
 
-    def test_security_agent_is_skipped_when_no_finding_exists(self):
+    def test_irrelevant_dimension_agents_are_skipped_for_single_dimension_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             service, _ = build_service(
                 Path(tmpdir),
@@ -446,11 +667,21 @@ class AnalysisServiceTests(unittest.TestCase):
                     },
                 },
             )
-            result = service.analyze(AnalysisRequest(code="return a + b", developer_id="alice"))
+            result = service.analyze(
+                AnalysisRequest(
+                    code="return a + b",
+                    developer_id="alice",
+                    mode="security",
+                )
+            )
             self.assertEqual("success", result.status)
             self.assertEqual(
                 "skipped",
-                next(entry.status for entry in result.agent_trace if entry.name == "security"),
+                next(entry.status for entry in result.agent_trace if entry.name == "quality_review"),
+            )
+            self.assertEqual(
+                "skipped",
+                next(entry.status for entry in result.agent_trace if entry.name == "performance_review"),
             )
 
     def test_file_analysis_creates_event_and_file_state_with_scores(self):
@@ -615,11 +846,101 @@ class AnalysisServiceTests(unittest.TestCase):
             self.assertEqual("", result.event_id)
             self.assertEqual([], repo.list_analysis_events("alice"))
 
+    def test_multi_finding_analysis_returns_security_and_performance_findings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service, _ = build_service(
+                Path(tmpdir),
+                responses={
+                    "planning": {
+                        "intent": "Authenticate a user and process data.",
+                        "entry_points": ["username", "password", "filename", "cmd"],
+                        "sensitive_operations": ["db.execute(...)", "open(...)", "os.system(...)"],
+                        "security_focus": ["SQL Injection", "Command Injection", "Path Traversal"],
+                    },
+                    "coding": {
+                        "findings": [
+                            {
+                                "dimension": "security",
+                                "vuln_found": True,
+                                "vuln_type": "SQL Injection",
+                                "vulnerable_line": "query = f\"SELECT * FROM users WHERE username = '{username}'\"",
+                                "pattern": "Unsafe SQL string interpolation.",
+                                "attack_scenario": "Attacker can inject SQL through username.",
+                                "suggested_fix": "Use parameterized queries.",
+                                "confidence": 0.95,
+                            },
+                            {
+                                "dimension": "performance",
+                                "vuln_found": True,
+                                "vuln_type": "Nested Loop",
+                                "vulnerable_line": "for i in range(len(numbers)):",
+                                "pattern": "Quadratic sorting implementation.",
+                                "attack_scenario": "Large lists will be slow to process.",
+                                "suggested_fix": "Use sorted() or a better algorithm.",
+                                "confidence": 0.82,
+                            },
+                        ]
+                    },
+                    "security": {
+                        "severity": "CRITICAL",
+                        "owasp_category": "A03:2021 - Injection",
+                        "cve_reference": "GENERIC",
+                        "data_flow": "user input reaches db.execute",
+                        "developer_note": "Use bound parameters.",
+                        "full_explanation": "Unsafe string-built SQL can be exploited.",
+                    },
+                },
+            )
+            code = (
+                "import os\n"
+                "def authenticate(username, password):\n"
+                "    query = f\"SELECT * FROM users WHERE username = '{username}'\"\n"
+                "    cursor.execute(query)\n"
+                "def sort_numbers(numbers):\n"
+                "    for i in range(len(numbers)):\n"
+                "        for j in range(len(numbers)):\n"
+                "            if numbers[i] < numbers[j]:\n"
+                "                numbers[i], numbers[j] = numbers[j], numbers[i]\n"
+                "def process_data():\n"
+                "    global data\n"
+                "    data.append(1)\n"
+                "    os.system(input('cmd: '))\n"
+            )
+            result = service.analyze(
+                AnalysisRequest(code=code, developer_id="alice", mode="full", file_uri="file:///demo.py")
+            )
+            self.assertEqual("success", result.status)
+            self.assertGreaterEqual(len(result.findings), 4)
+            issue_types = {finding["vuln_type"] for finding in result.findings}
+            self.assertIn("SQL Injection", issue_types)
+            self.assertIn("Command Injection", issue_types)
+            self.assertIn("Nested Loop", issue_types)
+            self.assertIn("Global State Misuse", issue_types)
+            self.assertLess(result.scores["security"], 100)
+            self.assertLess(result.scores["quality"], 100)
+            self.assertLess(result.scores["performance"], 100)
+            self.assertTrue(
+                all(finding["dimension"] == "security" for finding in result.dimensions["security"]["findings"])
+            )
+            self.assertTrue(
+                all(finding["dimension"] == "quality" for finding in result.dimensions["quality"]["findings"])
+            )
+            self.assertTrue(
+                all(finding["dimension"] == "performance" for finding in result.dimensions["performance"]["findings"])
+            )
+
     def test_custom_registered_agent_runs_without_service_changes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = AppConfig(
                 db_path=Path(tmpdir) / "memory.db",
-                enabled_agents=("planning", "coding", "security", "annotate"),
+                enabled_agents=(
+                    "planning",
+                    "security_review",
+                    "quality_review",
+                    "performance_review",
+                    "aggregation",
+                    "annotate",
+                ),
             )
             repository = SQLiteFindingsRepository(config.db_path)
             repository.initialize()
@@ -680,6 +1001,17 @@ class AnalysisServiceTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_parse_analysis_request_defaults_to_full_mode(self):
+        request, error_result = parse_analysis_request(
+            {"code": "print(1)", "developer_id": "alice"}
+        )
+        self.assertIsNone(error_result)
+        assert request is not None
+        self.assertEqual("full", request.mode)
+
+    def test_analysis_input_schema_defaults_to_full_mode(self):
+        self.assertEqual("full", analysis_input_schema()["properties"]["mode"]["default"])
+
     def test_http_invalid_mode_returns_normalized_failure_response(self):
         app = create_app()
         app.config["TESTING"] = True

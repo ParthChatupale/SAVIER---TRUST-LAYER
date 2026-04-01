@@ -1,27 +1,24 @@
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
-from dotenv import load_dotenv
+from __future__ import annotations
+
 import os
+
+from dotenv import load_dotenv
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
+
+
 load_dotenv()
 
-key = os.getenv("GEM29b_api_key")
+api_key = os.getenv("NVIDIA_API_KEY") or os.getenv("GEM29b_api_key")
+if not api_key:
+    raise RuntimeError("Set NVIDIA_API_KEY or GEM29b_api_key in .env before running this script.")
 
-if key:
-    print(f"Key loaded! Length: {len(key)}")
-    print(f"Starts with: '{key[:5]}'") # Check for unexpected spaces at the start
-else:
-    print("Error: Could not find 'GEM29b_api_key' in environment.")
-
-api_key = os.getenv("GEM29b_api_key")
 client = ChatNVIDIA(
-  model="google/gemma-2-9b-it",
-  api_key=api_key,
-  temperature=0.2,
-  top_p=0.7,
-  max_tokens=1024,
+    model="google/gemma-2-9b-it",
+    api_key=api_key,
+    temperature=0.2,
+    top_p=0.7,
+    max_completion_tokens=1024,
 )
 
-for chunk in client.stream([{"role":"user","content":"Hello How are you please answer"}]): 
-  print(chunk.content, end="")
-
-
-
+for chunk in client.stream([{"role": "user", "content": "Hello. Please answer in one short sentence."}]):
+    print(chunk.content, end="")

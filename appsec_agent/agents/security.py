@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from appsec_agent.core.models import FindingCandidate, SecurityAssessment
+from appsec_agent.core.models import FindingCandidate, FindingCollection, SecurityAssessment
 from appsec_agent.core.plugins import AgentSpec, ExecutionContext
 from appsec_agent.core.taxonomy import normalize_owasp_category, normalize_severity
 from appsec_agent.providers.base import ModelOutputError, ModelProvider
@@ -60,17 +60,18 @@ Code:
 
 
 def should_run_security_agent(context: ExecutionContext) -> bool:
-    finding = context.get_artifact("coding")
-    return bool(finding and finding.vuln_found)
+    findings = context.get_artifact("coding")
+    return bool(findings and findings.vuln_found)
 
 
 def run_security_agent(context: ExecutionContext) -> None:
-    finding = context.get_artifact("coding")
-    if finding is None:
+    findings = context.get_artifact("coding")
+    if findings is None:
         raise ValueError("security agent requires coding output.")
+    finding = findings.primary_finding()
     security = security_agent(
         provider=context.provider,
-        model=context.config.model_security,
+        model=context.metadata.get("active_model", context.config.model_security),
         code=context.request.code,
         coding_result=finding,
         developer_history=context.history_payload(),
@@ -84,7 +85,7 @@ def get_agent_spec() -> AgentSpec:
         stage="security",
         order=30,
         description="Explain severity, impact, and remediation for a finding.",
-        input_type=FindingCandidate,
+        input_type=FindingCollection,
         output_type=SecurityAssessment,
         model_config_key="model_security",
         artifact_key="security",

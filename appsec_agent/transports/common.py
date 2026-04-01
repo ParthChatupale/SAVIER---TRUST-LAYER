@@ -20,7 +20,7 @@ ANALYZE_CODE_SCHEMA = {
         "mode": {
             "type": "string",
             "enum": ["security", "quality", "performance", "full"],
-            "default": "security",
+            "default": "full",
             "description": "Type of analysis to run.",
         },
         "file_uri": {
@@ -102,7 +102,8 @@ def clear_history_payload(developer_id: str) -> dict[str, Any]:
 
 def _failed_request_response(payload: dict[str, Any], error: str) -> AnalysisResponse:
     developer_id = str(payload.get("developer_id", "anonymous"))
-    mode = "security"
+    raw_mode = str(payload.get("mode", "full")).strip().lower()
+    mode = raw_mode if raw_mode in {"security", "quality", "performance", "full"} else "full"
     return AnalysisResponse(
         status="failed",
         developer_id=developer_id,

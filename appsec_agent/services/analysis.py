@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from hashlib import sha256
 
 from appsec_agent.core.config import AppConfig
 from appsec_agent.core.models import (
+    AggregatedReviewResult,
     AgentTraceEntry,
+    AnalysisProfile,
     AnalysisEvent,
     AnalysisRequest,
     AnalysisResponse,
@@ -15,13 +19,15 @@ from appsec_agent.core.models import (
     merge_dimension_scores,
 )
 from appsec_agent.core.plugins import AgentRegistry, AgentSpec, ExecutionContext
-from appsec_agent.core.taxonomy import severity_for_issue
+from appsec_agent.core.taxonomy import normalize_severity, severity_for_issue
 from appsec_agent.memory.store import SQLiteFindingsRepository
 from appsec_agent.providers.base import ModelProvider, ProviderError
 
 
 @dataclass(slots=True)
 class AnalysisService:
+    PIPELINE_FINGERPRINT_VERSION = "pipeline-v2.1-normalized"
+
     config: AppConfig
     provider: ModelProvider
     repository: SQLiteFindingsRepository
@@ -56,46 +62,46 @@ class AnalysisService:
         if context.planning is not None:
             response.planning = context.planning.to_dict()
 
-        if context.finding is None:
+        if context.aggregation is None:
             response.status = "failed"
-            response.errors.append("Pipeline completed without a finding result.")
+            response.errors.append("Pipeline completed without an aggregated review result.")
             return response
 
-        response.vuln_found = context.finding.vuln_found
-        response.vuln_type = context.finding.vuln_type
-        response.vulnerable_line = context.finding.vulnerable_line
-        response.attack_scenario = context.finding.attack_scenario
-        response.suggested_fix = context.finding.suggested_fix
-        response.confidence = context.finding.confidence
+        aggregate = context.aggregation
+        response.findings = [finding.to_dict() for finding in aggregate.findings]
+        for finding in response.findings:
+            finding["severity"] = normalize_severity("", vuln_type=str(finding.get("vuln_type", "")))
+        response.dimensions = {name: result.to_dict() for name, result in aggregate.dimensions.items()}
+        response.primary_finding = aggregate.primary_finding.to_dict()
+        primary_finding = aggregate.primary_finding
+        response.vuln_found = aggregate.vuln_found
+        response.vuln_type = primary_finding.vuln_type
+        response.vulnerable_line = primary_finding.vulnerable_line
+        response.attack_scenario = primary_finding.explanation
+        response.suggested_fix = primary_finding.suggested_fix
+        response.confidence = primary_finding.confidence
+        response.severity = primary_finding.severity
+        profile = self._analysis_profile()
+        response.analysis_profile = profile.to_dict()
 
-        if not context.finding.vuln_found:
+        if not aggregate.vuln_found:
             response.full_explanation = "No vulnerability detected in this code snippet."
             response.developer_note = "No vulnerability found. Code looks clean."
         else:
-            if context.security is None:
-                response.severity = severity_for_issue(context.finding.vuln_type)
-                if response.status == "success":
-                    response.status = "partial"
-            else:
-                response.severity = context.security.severity
-                response.owasp_category = context.security.owasp_category
-                response.data_flow = context.security.data_flow
-                response.developer_note = context.security.developer_note
-                response.full_explanation = context.security.full_explanation
-
             try:
-                self.repository.save_finding(
-                    developer=request.developer_id,
-                    vuln_type=response.vuln_type,
-                    code_snippet=request.code[:200],
-                    explanation=response.full_explanation or response.attack_scenario,
-                )
+                for finding in aggregate.findings:
+                    self.repository.save_finding(
+                        developer=request.developer_id,
+                        vuln_type=finding.vuln_type,
+                        code_snippet=(finding.vulnerable_line or request.code[:200])[:200],
+                        explanation=finding.attack_scenario or finding.pattern,
+                    )
             except Exception as exc:  # pragma: no cover - defensive guard
                 response.warnings.append(f"Could not save finding history: {exc}")
                 if response.status == "success":
                     response.status = "partial"
 
-        self._enrich_with_revision_state(request, response)
+        self._enrich_with_revision_state(request, response, profile)
         return response
 
     def get_dashboard_summary(self, developer_id: str) -> dict[str, object]:
@@ -109,42 +115,119 @@ class AnalysisService:
         return state.to_dict() if state is not None else None
 
     def _run_pipeline(self, context: ExecutionContext) -> bool:
-        for spec in self.registry.get_enabled_agents(self.config):
-            should_continue = self._run_agent(spec, context)
+        enabled_specs = self.registry.get_enabled_agents(self.config)
+        index = 0
+        while index < len(enabled_specs):
+            spec = enabled_specs[index]
+            if spec.parallel_group:
+                group = [spec]
+                index += 1
+                while index < len(enabled_specs) and enabled_specs[index].parallel_group == spec.parallel_group:
+                    group.append(enabled_specs[index])
+                    index += 1
+                should_continue = self._run_parallel_group(group, context)
+            else:
+                should_continue = self._run_agent(spec, context)
+                index += 1
             if not should_continue:
                 return False
         return True
 
     def _run_agent(self, spec: AgentSpec, context: ExecutionContext) -> bool:
-        model_name = context.model_for(spec)
-        if spec.should_run is not None and not spec.should_run(context):
-            context.response.agent_trace.append(
-                AgentTraceEntry(
-                    name=spec.name,
-                    stage=spec.stage,
-                    status="skipped",
-                    model=model_name,
-                )
-            )
-            return True
-        try:
-            spec.runner(context)
-        except ProviderError as exc:
-            self._record_failure(spec, context.response, model_name, str(exc), required=spec.required)
-            return False if spec.required else True
-        except Exception as exc:
-            self._record_failure(spec, context.response, model_name, str(exc), required=spec.required)
-            return False if spec.required else True
-
+        result = self._execute_spec(spec, context)
+        context.response.warnings.extend(result.warnings)
         context.response.agent_trace.append(
             AgentTraceEntry(
                 name=spec.name,
                 stage=spec.stage,
-                status="success",
-                model=model_name,
+                status=result.status,
+                model=result.model_name,
+                error=result.error,
             )
         )
+        if result.status != "failed":
+            return True
+        self._record_failure(spec, context.response, result.model_name, result.error, required=spec.required)
+        return False if spec.required else True
+
+    def _run_parallel_group(self, specs: list[AgentSpec], context: ExecutionContext) -> bool:
+        submissions: list[tuple[AgentSpec, ExecutionContext]] = []
+        for spec in specs:
+            child = context.spawn_child()
+            submissions.append((spec, child))
+
+        results: list[tuple[AgentSpec, ExecutionContext, StageExecutionResult]] = []
+        with ThreadPoolExecutor(max_workers=len(submissions)) as executor:
+            future_map = {
+                executor.submit(self._execute_spec, spec, child): (spec, child)
+                for spec, child in submissions
+            }
+            for future, pair in future_map.items():
+                spec, child = pair
+                results.append((spec, child, future.result()))
+
+        results.sort(key=lambda item: (item[0].order, item[0].name))
+        runnable = 0
+        successes = 0
+        failures: list[tuple[AgentSpec, StageExecutionResult]] = []
+        for spec, child, result in results:
+            context.response.warnings.extend(result.warnings)
+            context.response.warnings.extend(child.response.warnings)
+            context.response.agent_trace.append(
+                AgentTraceEntry(
+                    name=spec.name,
+                    stage=spec.stage,
+                    status=result.status,
+                    model=result.model_name,
+                    error=result.error,
+                )
+            )
+            if result.status == "skipped":
+                continue
+            runnable += 1
+            if result.status == "success":
+                successes += 1
+                if spec.artifact_key and spec.artifact_key in child.artifacts:
+                    context.set_artifact(spec.artifact_key, child.get_artifact(spec.artifact_key))
+            else:
+                failures.append((spec, result))
+
+        if failures and successes:
+            if context.response.status == "success":
+                context.response.status = "partial"
+            context.response.warnings.extend(result.error for _, result in failures if result.error)
+            return True
+
+        if failures and not successes and runnable:
+            context.response.status = "failed"
+            context.response.errors.extend(result.error for _, result in failures if result.error)
+            return False
+
         return True
+
+    def _execute_spec(self, spec: AgentSpec, context: ExecutionContext) -> "StageExecutionResult":
+        model_candidates = context.model_candidates_for(spec)
+        model_name = model_candidates[0]
+        warnings: list[str] = []
+        if spec.should_run is not None and not spec.should_run(context):
+            return StageExecutionResult(status="skipped", model_name=model_name)
+        for candidate in model_candidates:
+            context.metadata["active_model"] = candidate
+            try:
+                spec.runner(context)
+                context.metadata.pop("active_model", None)
+                return StageExecutionResult(status="success", model_name=candidate, warnings=warnings)
+            except ProviderError as exc:
+                if candidate != model_candidates[-1]:
+                    warnings.append(f"{spec.stage} stage fallback from {candidate} to next model: {exc}")
+                    continue
+                context.metadata.pop("active_model", None)
+                return StageExecutionResult(status="failed", model_name=candidate, error=str(exc), warnings=warnings)
+            except Exception as exc:
+                context.metadata.pop("active_model", None)
+                return StageExecutionResult(status="failed", model_name=candidate, error=str(exc), warnings=warnings)
+        context.metadata.pop("active_model", None)
+        return StageExecutionResult(status="failed", model_name=model_name, error=f"{spec.stage} stage failed", warnings=warnings)
 
     def _record_failure(
         self,
@@ -162,24 +245,11 @@ class AnalysisService:
             response.warnings.append(error)
             if response.status == "success":
                 response.status = "partial"
-        response.agent_trace.append(
-            AgentTraceEntry(
-                name=spec.name,
-                stage=spec.stage,
-                status="failed",
-                model=model_name,
-                error=error,
-            )
-        )
 
-    def _enrich_with_revision_state(self, request: AnalysisRequest, response: AnalysisResponse) -> None:
+    def _enrich_with_revision_state(self, request: AnalysisRequest, response: AnalysisResponse, profile: AnalysisProfile) -> None:
         findings = FindingRecord.from_analysis(
             mode=request.mode,
-            vuln_found=response.vuln_found,
-            vuln_type=response.vuln_type,
-            severity=response.severity,
-            vulnerable_line=response.vulnerable_line,
-            explanation=response.full_explanation or response.attack_scenario or response.developer_note,
+            findings=context_finding_candidates(response),
         )
         previous_state = self.repository.get_file_state(request.developer_id, request.file_uri) if request.file_uri else None
         evaluated_dimensions = self._evaluated_dimensions(request.mode, findings)
@@ -202,7 +272,11 @@ class AnalysisService:
             return
 
         content_hash = code_content_hash(request.code)
-        if previous_state is not None and previous_state.content_hash == content_hash:
+        if (
+            previous_state is not None
+            and previous_state.content_hash == content_hash
+            and previous_state.analysis_profile == profile.fingerprint
+        ):
             response.event_id = previous_state.last_event_id
             return
 
@@ -214,6 +288,7 @@ class AnalysisService:
             mode=request.mode,
             content_hash=content_hash,
             status=response.status,
+            analysis_profile=profile.fingerprint,
             project_id=request.project_id or "",
             scores=scores,
             findings=findings,
@@ -222,6 +297,9 @@ class AnalysisService:
                 "vuln_type": response.vuln_type,
                 "severity": response.severity,
                 "status": response.status,
+                "finding_count": len(findings),
+                "dimensions": response.dimensions,
+                "primary_finding": response.primary_finding,
             },
         )
         stored_event = self.repository.insert_analysis_event(event)
@@ -230,6 +308,7 @@ class AnalysisService:
                 developer_id=request.developer_id,
                 file_uri=request.file_uri,
                 content_hash=content_hash,
+                analysis_profile=profile.fingerprint,
                 last_event_id=stored_event.event_id,
                 source=request.source,
                 mode=request.mode,
@@ -252,3 +331,75 @@ class AnalysisService:
         if mode in {"security", "quality", "performance"}:
             return [mode]
         return ["security"]
+
+    def _analysis_profile(self) -> AnalysisProfile:
+        enabled_agents = [spec.name for spec in self.registry.get_enabled_agents(self.config)]
+        model_profile = {
+            "planning": self.config.model_planning,
+            "security_review": self.config.model_security_review,
+            "quality_review": self.config.model_quality_review,
+            "performance_review": self.config.model_performance_review,
+            "aggregation": self.config.model_aggregation,
+        }
+        fingerprint_source = "|".join(
+            [
+                self.PIPELINE_FINGERPRINT_VERSION,
+                self.config.provider_name,
+                ",".join(enabled_agents),
+                *[f"{key}={value}" for key, value in sorted(model_profile.items())],
+            ]
+        )
+        fingerprint = sha256(fingerprint_source.encode("utf-8")).hexdigest()[:16]
+        return AnalysisProfile(
+            pipeline_version="v2-specialist-r2",
+            provider=self.config.provider_name,
+            enabled_agents=enabled_agents,
+            model_profile=model_profile,
+            fingerprint=fingerprint,
+        )
+
+
+def context_finding_candidates(response: AnalysisResponse):
+    from appsec_agent.core.models import FindingCandidate
+
+    candidates: list[FindingCandidate] = []
+    for finding in response.findings:
+        if not isinstance(finding, dict):
+            continue
+        payload = dict(finding)
+        if not payload.get("suggested_fix"):
+            payload["suggested_fix"] = response.suggested_fix
+        if not payload.get("attack_scenario"):
+            payload["attack_scenario"] = response.attack_scenario or response.developer_note
+        candidates.append(FindingCandidate.from_payload(payload, mode=response.mode))
+    if candidates:
+        return candidates
+    if not response.vuln_found:
+        return []
+    return [
+        FindingCandidate.from_payload(
+            {
+                "dimension": "",
+                "vuln_found": response.vuln_found,
+                "vuln_type": response.vuln_type,
+                "vulnerable_line": response.vulnerable_line,
+                "pattern": "",
+                "attack_scenario": response.attack_scenario or response.full_explanation or response.developer_note,
+                "suggested_fix": response.suggested_fix,
+                "confidence": response.confidence,
+            },
+            mode=response.mode,
+        )
+    ]
+
+
+@dataclass(slots=True)
+class StageExecutionResult:
+    status: str
+    model_name: str
+    error: str = ""
+    warnings: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.warnings is None:
+            self.warnings = []
