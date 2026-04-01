@@ -15,8 +15,11 @@ from appsec_agent.transports.common import (
     clear_history_payload,
     http_status_for_result,
     parse_analysis_request,
+    serialize_dashboard,
+    serialize_file_state,
     serialize_history,
     serialize_result,
+    serialize_timeline,
 )
 
 
@@ -45,6 +48,31 @@ def create_app() -> Flask:
         developer_id = str(payload.get("developer_id", "anonymous"))
         get_repository().clear_developer_history(developer_id)
         return jsonify(clear_history_payload(developer_id))
+
+    @app.route("/dashboard", methods=["GET"])
+    def dashboard():
+        developer_id = request.args.get("developer_id", "anonymous")
+        summary = get_analysis_service().get_dashboard_summary(developer_id)
+        return jsonify(serialize_dashboard(summary))
+
+    @app.route("/timeline", methods=["GET"])
+    def timeline():
+        developer_id = request.args.get("developer_id", "anonymous")
+        file_uri = request.args.get("file_uri")
+        limit = int(request.args.get("limit", "20"))
+        events = get_analysis_service().get_analysis_timeline(developer_id, file_uri=file_uri, limit=limit)
+        return jsonify(serialize_timeline(events))
+
+    @app.route("/file-state", methods=["GET"])
+    def file_state():
+        developer_id = request.args.get("developer_id", "anonymous")
+        file_uri = request.args.get("file_uri", "")
+        if not file_uri:
+            return jsonify({"error": "file_uri is required"}), 400
+        state = get_analysis_service().get_file_state(developer_id, file_uri)
+        if state is None:
+            return jsonify({"error": "File state not found"}), 404
+        return jsonify(serialize_file_state(state))
 
     @app.route("/health", methods=["GET"])
     def health():

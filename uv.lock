@@ -160,6 +160,8 @@ dependencies = [
     { name = "flask" },
     { name = "langchain" },
     { name = "langchain-community" },
+    { name = "langchain-core" },
+    { name = "langchain-nvidia-ai-endpoints" },
     { name = "mcp" },
     { name = "ollama" },
     { name = "tree-sitter" },
@@ -171,6 +173,8 @@ requires-dist = [
     { name = "flask", specifier = ">=3.1.3" },
     { name = "langchain", specifier = ">=1.2.13" },
     { name = "langchain-community", specifier = ">=0.4.1" },
+    { name = "langchain-core", specifier = ">=1.2.23" },
+    { name = "langchain-nvidia-ai-endpoints", specifier = ">=1.2.1" },
     { name = "mcp", specifier = ">=1.26.0" },
     { name = "ollama", specifier = ">=0.6.1" },
     { name = "tree-sitter", specifier = ">=0.25.2" },
@@ -454,6 +458,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/64/a4/f71d9cf3a5ac257c993b5ca3f93df5f7fb395c725e7f1e6479d2514173c3/dataclasses_json-0.6.7.tar.gz", hash = "sha256:b6b3e528266ea45b9535223bc53ca645f5208833c29229e847b3f26a1cc55fc0", size = 32227, upload-time = "2024-06-09T16:20:19.103Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c3/be/d0d44e092656fe7a06b55e6103cbce807cdbdee17884a5367c68c9860853/dataclasses_json-0.6.7-py3-none-any.whl", hash = "sha256:0dbf33f26c8d5305befd61b39d2b3414e8a407bedc2834dea9b8d642666fb40a", size = 28686, upload-time = "2024-06-09T16:20:16.715Z" },
+]
+
+[[package]]
+name = "filetype"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/bb/29/745f7d30d47fe0f251d3ad3dc2978a23141917661998763bebb6da007eb1/filetype-1.2.0.tar.gz", hash = "sha256:66b56cd6474bf41d8c54660347d37afcc3f7d1970648de365c102ef77548aadb", size = 998020, upload-time = "2022-11-02T17:34:04.141Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/18/79/1b8fa1bb3568781e84c9200f951c735f3f157429f44be0495da55894d620/filetype-1.2.0-py2.py3-none-any.whl", hash = "sha256:7ce71b6880181241cf7ac8697a2f1eb6a8bd9b429f7ad6d27b8db9ba5f1c2d25", size = 19970, upload-time = "2022-11-02T17:34:01.425Z" },
 ]
 
 [[package]]
@@ -826,6 +839,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/1d/47/a5f21b651e9cbd7a26c3e5809336d10a0be94ef7bdf6bea47f2ad9fff1a8/langchain_core-1.2.23.tar.gz", hash = "sha256:fdec64f90cfea25317e88d9803c44684af1f4e30dec4e58320dd7393bb0f0785", size = 841684, upload-time = "2026-03-27T23:28:14.6Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9b/5a/6ff2d76618e4cac531ea51d4ef44c6add36575a84c3f0f8877aee68c951a/langchain_core-1.2.23-py3-none-any.whl", hash = "sha256:70866dfc5275b7840ce272ff70f0ff216c8666ab25dc1b41964a4ef58c02a3ff", size = 506709, upload-time = "2026-03-27T23:28:13.372Z" },
+]
+
+[[package]]
+name = "langchain-nvidia-ai-endpoints"
+version = "1.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "filetype" },
+    { name = "langchain-core" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f0/d5/5d70c7b7a66dfabc4c355e408a066e8bef7d2715f3b7854ce44704886119/langchain_nvidia_ai_endpoints-1.2.1.tar.gz", hash = "sha256:055d2511fa7374da65e5d3dd1705fb09125620a124c6247212d661286f64fa8d", size = 57520, upload-time = "2026-03-16T16:42:34.682Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c7/b7/99f72331842b0f62da891411c5590ff7fab70a1a753a9a1be9348921995e/langchain_nvidia_ai_endpoints-1.2.1-py3-none-any.whl", hash = "sha256:eafb2186dea25d163089552c062274664540f2cbe251861c515700645fbf256d", size = 61820, upload-time = "2026-03-16T16:42:33.657Z" },
 ]
 
 [[package]]

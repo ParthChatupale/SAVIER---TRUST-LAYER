@@ -25,6 +25,36 @@ SEVERITY_MAP = {
     "Redundant Computation": "LOW",
 }
 
+DIMENSION_MAP = {
+    "SQL Injection": "security",
+    "Command Injection": "security",
+    "Hardcoded Secret": "security",
+    "XSS": "security",
+    "Path Traversal": "security",
+    "Insecure Deserialization": "security",
+    "Broken Authentication": "security",
+    "Sensitive Data Exposure": "security",
+    "Security Misconfiguration": "security",
+    "No Input Validation": "security",
+    "God Function": "quality",
+    "Missing Error Handling": "quality",
+    "Magic Numbers": "quality",
+    "Missing Type Hints": "quality",
+    "N+1 Query": "performance",
+    "Nested Loop": "performance",
+    "Missing Cache": "performance",
+    "Blocking IO": "performance",
+    "Redundant Computation": "performance",
+}
+
+SCORE_PENALTY_MAP = {
+    "CRITICAL": 40,
+    "HIGH": 25,
+    "MEDIUM": 15,
+    "LOW": 5,
+    "NONE": 0,
+}
+
 OWASP_CATEGORY_MAP = {
     "SQL Injection": "A03:2021 - Injection",
     "Command Injection": "A03:2021 - Injection",
@@ -226,3 +256,17 @@ def normalize_suggested_fix(raw_value: str, vuln_type: str = "", vulnerable_line
     if value and value != vulnerable_line.strip():
         return value
     return "Refactor this code to remove the identified risk and apply the safe pattern for this operation."
+
+
+def dimension_for_issue(vuln_type: str, mode: str = "security") -> str:
+    canonical = normalize_vulnerability_type(vuln_type)
+    if canonical in DIMENSION_MAP:
+        return DIMENSION_MAP[canonical]
+    if mode in {"security", "quality", "performance"}:
+        return mode
+    return "security"
+
+
+def score_penalty_for_severity(severity: str) -> int:
+    normalized = normalize_severity(severity, vuln_type="")
+    return SCORE_PENALTY_MAP.get(normalized, 0)

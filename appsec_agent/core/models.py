@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from hashlib import sha256
 import re
 from typing import Any, Literal
 
 from appsec_agent.core.taxonomy import (
+    dimension_for_issue,
     normalize_owasp_category,
     normalize_severity,
     normalize_suggested_fix,
     normalize_vulnerability_type,
+    score_penalty_for_severity,
 )
 
 
@@ -22,6 +25,9 @@ class AnalysisRequest:
     developer_id: str = "anonymous"
     mode: AnalysisMode = "security"
     debug: bool = False
+    file_uri: str | None = None
+    source: str = "ide_extension"
+    project_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in VALID_MODES:
@@ -35,6 +41,9 @@ class AnalysisRequest:
             developer_id=str(payload.get("developer_id", "anonymous")),
             mode=str(payload.get("mode", "security")),  # type: ignore[arg-type]
             debug=bool(payload.get("debug", False)),
+            file_uri=_coerce_optional_string(payload.get("file_uri")),
+            source=_coerce_optional_string(payload.get("source")) or "ide_extension",
+            project_id=_coerce_optional_string(payload.get("project_id")),
         )
 
 
@@ -185,11 +194,189 @@ class AnalysisResponse:
     warnings: list[str] = field(default_factory=list)
     agent_trace: list[AgentTraceEntry] = field(default_factory=list)
     planning: dict[str, Any] = field(default_factory=dict)
+    file_uri: str = ""
+    event_id: str = ""
+    scores: dict[str, Any] = field(default_factory=dict)
+    diff: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["agent_trace"] = [entry.to_dict() for entry in self.agent_trace]
         return data
+
+
+@dataclass(slots=True)
+class FindingRecord:
+    key: str
+    dimension: str
+    issue_type: str
+    severity: str
+    line: str = ""
+    explanation: str = ""
+
+    @classmethod
+    def from_analysis(
+        cls,
+        *,
+        mode: AnalysisMode,
+        vuln_found: bool,
+        vuln_type: str,
+        severity: str,
+        vulnerable_line: str,
+        explanation: str,
+    ) -> list["FindingRecord"]:
+        if not vuln_found or not vuln_type:
+            return []
+        normalized_type = normalize_vulnerability_type(vuln_type)
+        normalized_severity = normalize_severity(severity, vuln_type=normalized_type)
+        line_or_snippet = (vulnerable_line or explanation).strip()
+        dimension = dimension_for_issue(normalized_type, mode=mode)
+        key = finding_key(dimension=dimension, issue_type=normalized_type, line_or_snippet=line_or_snippet)
+        return [
+            cls(
+                key=key,
+                dimension=dimension,
+                issue_type=normalized_type,
+                severity=normalized_severity,
+                line=vulnerable_line.strip(),
+                explanation=explanation.strip(),
+            )
+        ]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class DimensionScores:
+    security: int = 100
+    quality: int = 100
+    performance: int = 100
+    overall: int = 100
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ScoreDelta:
+    score_delta: int = 0
+    fixed_findings: list[str] = field(default_factory=list)
+    new_findings: list[str] = field(default_factory=list)
+    unchanged_findings: list[str] = field(default_factory=list)
+
+    @property
+    def fixed_count(self) -> int:
+        return len(self.fixed_findings)
+
+    @property
+    def new_issue_count(self) -> int:
+        return len(self.new_findings)
+
+    @property
+    def unchanged_count(self) -> int:
+        return len(self.unchanged_findings)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "score_delta": self.score_delta,
+            "fixed_findings": list(self.fixed_findings),
+            "new_findings": list(self.new_findings),
+            "unchanged_findings": list(self.unchanged_findings),
+            "fixed_count": self.fixed_count,
+            "new_issue_count": self.new_issue_count,
+            "unchanged_count": self.unchanged_count,
+        }
+
+
+@dataclass(slots=True)
+class AnalysisEvent:
+    event_id: str
+    developer_id: str
+    file_uri: str
+    source: str
+    mode: AnalysisMode
+    content_hash: str
+    status: str
+    timestamp: str = ""
+    project_id: str = ""
+    scores: DimensionScores = field(default_factory=DimensionScores)
+    findings: list[FindingRecord] = field(default_factory=list)
+    diff: ScoreDelta = field(default_factory=ScoreDelta)
+    summary: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "developer_id": self.developer_id,
+            "file_uri": self.file_uri,
+            "source": self.source,
+            "mode": self.mode,
+            "content_hash": self.content_hash,
+            "status": self.status,
+            "timestamp": self.timestamp,
+            "project_id": self.project_id,
+            "scores": self.scores.to_dict(),
+            "findings": [finding.to_dict() for finding in self.findings],
+            "diff": self.diff.to_dict(),
+            "summary": dict(self.summary),
+        }
+
+
+@dataclass(slots=True)
+class FileState:
+    developer_id: str
+    file_uri: str
+    content_hash: str
+    last_event_id: str = ""
+    source: str = ""
+    mode: AnalysisMode = "security"
+    status: str = "success"
+    updated_at: str = ""
+    project_id: str = ""
+    scores: DimensionScores = field(default_factory=DimensionScores)
+    findings: list[FindingRecord] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "developer_id": self.developer_id,
+            "file_uri": self.file_uri,
+            "content_hash": self.content_hash,
+            "last_event_id": self.last_event_id,
+            "source": self.source,
+            "mode": self.mode,
+            "status": self.status,
+            "updated_at": self.updated_at,
+            "project_id": self.project_id,
+            "scores": self.scores.to_dict(),
+            "findings": [finding.to_dict() for finding in self.findings],
+        }
+
+
+@dataclass(slots=True)
+class DashboardSummary:
+    developer_id: str
+    total_files: int = 0
+    total_events: int = 0
+    files_with_findings: int = 0
+    open_findings: int = 0
+    average_scores: DimensionScores = field(default_factory=DimensionScores)
+    score_trend: list[dict[str, Any]] = field(default_factory=list)
+    current_files: list[FileState] = field(default_factory=list)
+    recent_events: list[AnalysisEvent] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "developer_id": self.developer_id,
+            "total_files": self.total_files,
+            "total_events": self.total_events,
+            "files_with_findings": self.files_with_findings,
+            "open_findings": self.open_findings,
+            "average_scores": self.average_scores.to_dict(),
+            "score_trend": [dict(item) for item in self.score_trend],
+            "current_files": [state.to_dict() for state in self.current_files],
+            "recent_events": [event.to_dict() for event in self.recent_events],
+        }
 
 
 def _coerce_str_list(value: Any) -> list[str]:
@@ -203,6 +390,13 @@ def _coerce_str_list(value: Any) -> list[str]:
             return []
         return [item.strip() for item in text.split(",") if item.strip()]
     return []
+
+
+def _coerce_optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _coerce_confidence(value: Any) -> float:
@@ -306,3 +500,60 @@ def _extract_sensitive_operations(code: str) -> list[str]:
         if re.search(pattern, code) and label not in operations:
             operations.append(label)
     return operations
+
+
+def finding_key(*, dimension: str, issue_type: str, line_or_snippet: str) -> str:
+    normalized_line = re.sub(r"\s+", " ", (line_or_snippet or "").strip()).lower()
+    normalized_type = normalize_vulnerability_type(issue_type) or issue_type.strip()
+    return f"{dimension}:{normalized_type}:{normalized_line}"
+
+
+def code_content_hash(code: str) -> str:
+    return sha256(code.encode("utf-8")).hexdigest()
+
+
+def merge_dimension_scores(
+    *,
+    previous: DimensionScores | None,
+    findings: list[FindingRecord],
+    evaluated_dimensions: list[str],
+) -> DimensionScores:
+    base = previous.to_dict() if previous is not None else DimensionScores().to_dict()
+    dimension_penalties = {"security": 0, "quality": 0, "performance": 0}
+    for finding in findings:
+        dimension_penalties[finding.dimension] += score_penalty_for_severity(finding.severity)
+
+    scores: dict[str, int] = {}
+    for dimension in ("security", "quality", "performance"):
+        if previous is None or dimension in evaluated_dimensions:
+            scores[dimension] = max(0, 100 - dimension_penalties[dimension])
+        else:
+            scores[dimension] = int(base[dimension])
+    scores["overall"] = round((scores["security"] + scores["quality"] + scores["performance"]) / 3)
+    return DimensionScores(**scores)
+
+
+def findings_for_dimension(findings: list[FindingRecord], dimension: str) -> list[FindingRecord]:
+    return [finding for finding in findings if finding.dimension == dimension]
+
+
+def diff_findings(
+    previous: list[FindingRecord],
+    current: list[FindingRecord],
+    *,
+    previous_scores: DimensionScores | None,
+    current_scores: DimensionScores,
+) -> ScoreDelta:
+    previous_keys = {finding.key for finding in previous}
+    current_keys = {finding.key for finding in current}
+
+    fixed = sorted(previous_keys - current_keys)
+    new = sorted(current_keys - previous_keys)
+    unchanged = sorted(previous_keys & current_keys)
+    previous_overall = previous_scores.overall if previous_scores is not None else current_scores.overall
+    return ScoreDelta(
+        score_delta=current_scores.overall - previous_overall,
+        fixed_findings=fixed,
+        new_findings=new,
+        unchanged_findings=unchanged,
+    )

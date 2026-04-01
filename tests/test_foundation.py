@@ -7,7 +7,19 @@ from pathlib import Path
 
 from appsec_agent.agents.registry import register_default_agents
 from appsec_agent.core.config import AppConfig
-from appsec_agent.core.models import AnalysisRequest, FindingCandidate, PlanningResult, SecurityAssessment
+from appsec_agent.core.models import (
+    AnalysisEvent,
+    AnalysisRequest,
+    DimensionScores,
+    FileState,
+    FindingCandidate,
+    FindingRecord,
+    PlanningResult,
+    ScoreDelta,
+    SecurityAssessment,
+    diff_findings,
+    merge_dimension_scores,
+)
 from appsec_agent.core.plugins import AgentRegistry, AgentSpec, ToolExecutionContext, ToolSpec
 from appsec_agent.core.taxonomy import (
     normalize_owasp_category,
@@ -59,6 +71,69 @@ class RepositoryTests(unittest.TestCase):
 
             repo.clear_developer_history("alice")
             self.assertEqual([], repo.get_developer_history("alice"))
+
+    def test_repository_tracks_file_state_and_analysis_events(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = SQLiteFindingsRepository(Path(tmpdir) / "memory.db")
+            repo.initialize()
+            event = repo.insert_analysis_event(
+                AnalysisEvent(
+                    event_id="",
+                    developer_id="alice",
+                    file_uri="file:///demo.py",
+                    source="ide_extension",
+                    mode="security",
+                    content_hash="hash-1",
+                    status="success",
+                    scores=DimensionScores(security=60, quality=100, performance=100, overall=87),
+                    findings=[
+                        FindingRecord(
+                            key="security:SQL Injection:query",
+                            dimension="security",
+                            issue_type="SQL Injection",
+                            severity="CRITICAL",
+                            line='query = "SELECT *" + user_id',
+                            explanation="Unsafe SQL concatenation.",
+                        )
+                    ],
+                    diff=ScoreDelta(
+                        score_delta=-13,
+                        new_findings=["security:SQL Injection:query"],
+                    ),
+                    summary={"vuln_type": "SQL Injection"},
+                )
+            )
+            repo.upsert_file_state(
+                FileState(
+                    developer_id="alice",
+                    file_uri="file:///demo.py",
+                    content_hash="hash-1",
+                    last_event_id=event.event_id,
+                    source="ide_extension",
+                    mode="security",
+                    status="success",
+                    scores=event.scores,
+                    findings=event.findings,
+                )
+            )
+
+            state = repo.get_file_state("alice", "file:///demo.py")
+            self.assertIsNotNone(state)
+            self.assertEqual("hash-1", state.content_hash)
+            self.assertEqual(event.event_id, state.last_event_id)
+
+            events = repo.list_analysis_events("alice", file_uri="file:///demo.py")
+            self.assertEqual(1, len(events))
+            self.assertEqual("ide_extension", events[0].source)
+
+            summary = repo.get_dashboard_summary("alice")
+            self.assertEqual(1, summary.total_files)
+            self.assertEqual(1, summary.total_events)
+            self.assertEqual(1, summary.open_findings)
+
+            repo.clear_analysis_history("alice")
+            self.assertIsNone(repo.get_file_state("alice", "file:///demo.py"))
+            self.assertEqual([], repo.list_analysis_events("alice"))
 
 
 class ModelValidationTests(unittest.TestCase):
@@ -157,6 +232,33 @@ class ModelValidationTests(unittest.TestCase):
         )
         self.assertEqual("SQL Injection", finding.vuln_type)
         self.assertIn("db.execute(query, (user_id,))", finding.suggested_fix)
+
+    def test_score_penalties_and_diffs_are_deterministic(self):
+        findings = [
+            FindingRecord(
+                key="security:SQL Injection:query",
+                dimension="security",
+                issue_type="SQL Injection",
+                severity="CRITICAL",
+                line="query = raw_sql",
+                explanation="unsafe",
+            )
+        ]
+        scores = merge_dimension_scores(previous=None, findings=findings, evaluated_dimensions=["security"])
+        self.assertEqual(60, scores.security)
+        self.assertEqual(100, scores.quality)
+        self.assertEqual(87, scores.overall)
+
+        improved_scores = merge_dimension_scores(previous=scores, findings=[], evaluated_dimensions=["security"])
+        delta = diff_findings(
+            previous=findings,
+            current=[],
+            previous_scores=scores,
+            current_scores=improved_scores,
+        )
+        self.assertEqual(13, delta.score_delta)
+        self.assertEqual(["security:SQL Injection:query"], delta.fixed_findings)
+        self.assertEqual([], delta.new_findings)
 
 
 class RegistryTests(unittest.TestCase):
@@ -350,6 +452,168 @@ class AnalysisServiceTests(unittest.TestCase):
                 "skipped",
                 next(entry.status for entry in result.agent_trace if entry.name == "security"),
             )
+
+    def test_file_analysis_creates_event_and_file_state_with_scores(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service, repo = build_service(
+                Path(tmpdir),
+                responses={
+                    "planning": {
+                        "intent": "Query user data.",
+                        "entry_points": ["user_id"],
+                        "sensitive_operations": ["db.execute"],
+                        "security_focus": ["SQL Injection"],
+                    },
+                    "coding": {
+                        "vuln_found": True,
+                        "vuln_type": "SQL Injection",
+                        "vulnerable_line": 'query = "SELECT * FROM users WHERE id=" + user_id',
+                        "pattern": "User input is concatenated into SQL.",
+                        "attack_scenario": "Attacker can inject SQL.",
+                        "suggested_fix": "Use parameterized queries.",
+                        "confidence": 0.92,
+                    },
+                    "security": {
+                        "severity": "CRITICAL",
+                        "owasp_category": "A03:2021 - Injection",
+                        "cve_reference": "GENERIC",
+                        "data_flow": "user input flows into db.execute",
+                        "developer_note": "Use bound parameters.",
+                        "full_explanation": "String concatenation turns data into executable SQL.",
+                    },
+                },
+            )
+            request = AnalysisRequest(
+                code='query = "SELECT * FROM users WHERE id=" + user_id',
+                developer_id="alice",
+                file_uri="file:///demo.py",
+                source="ide_extension",
+            )
+            result = service.analyze(request)
+            self.assertEqual("success", result.status)
+            self.assertTrue(result.event_id)
+            self.assertEqual("file:///demo.py", result.file_uri)
+            self.assertEqual(60, result.scores["security"])
+            self.assertEqual(0, result.diff["score_delta"])
+            self.assertEqual(1, result.diff["new_issue_count"])
+
+            state = repo.get_file_state("alice", "file:///demo.py")
+            self.assertIsNotNone(state)
+            self.assertEqual(result.event_id, state.last_event_id)
+
+    def test_reanalysis_tracks_improvement_and_skips_duplicate_hashes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = AppConfig(db_path=Path(tmpdir) / "memory.db")
+            repository = SQLiteFindingsRepository(config.db_path)
+            repository.initialize()
+            registry = register_default_agents(AgentRegistry())
+
+            insecure_provider = FakeProvider(
+                responses={
+                    "planning": {
+                        "intent": "Query user data.",
+                        "entry_points": ["user_id"],
+                        "sensitive_operations": ["db.execute"],
+                        "security_focus": ["SQL Injection"],
+                    },
+                    "coding": {
+                        "vuln_found": True,
+                        "vuln_type": "SQL Injection",
+                        "vulnerable_line": 'query = "SELECT * FROM users WHERE id=" + user_id',
+                        "pattern": "User input is concatenated into SQL.",
+                        "attack_scenario": "Attacker can inject SQL.",
+                        "suggested_fix": "Use parameterized queries.",
+                        "confidence": 0.92,
+                    },
+                    "security": {
+                        "severity": "CRITICAL",
+                        "owasp_category": "A03:2021 - Injection",
+                        "cve_reference": "GENERIC",
+                        "data_flow": "user input flows into db.execute",
+                        "developer_note": "Use bound parameters.",
+                        "full_explanation": "String concatenation turns data into executable SQL.",
+                    },
+                }
+            )
+            insecure_service = AnalysisService(
+                config=config,
+                provider=insecure_provider,
+                repository=repository,
+                registry=registry,
+            )
+            insecure_code = 'query = "SELECT * FROM users WHERE id=" + user_id'
+            insecure_result = insecure_service.analyze(
+                AnalysisRequest(code=insecure_code, developer_id="alice", file_uri="file:///demo.py")
+            )
+            self.assertEqual(1, len(repository.list_analysis_events("alice", "file:///demo.py")))
+
+            clean_provider = FakeProvider(
+                responses={
+                    "planning": {
+                        "intent": "Query user data safely.",
+                        "entry_points": ["user_id"],
+                        "sensitive_operations": ["db.execute"],
+                        "security_focus": ["SQL Injection"],
+                    },
+                    "coding": {
+                        "vuln_found": False,
+                        "vuln_type": "",
+                        "vulnerable_line": "",
+                        "pattern": "",
+                        "attack_scenario": "",
+                        "suggested_fix": "",
+                        "confidence": 0.0,
+                    },
+                }
+            )
+            clean_service = AnalysisService(
+                config=config,
+                provider=clean_provider,
+                repository=repository,
+                registry=registry,
+            )
+            clean_code = 'query = "SELECT * FROM users WHERE id = ?"\nreturn db.execute(query, (user_id,))'
+            clean_result = clean_service.analyze(
+                AnalysisRequest(code=clean_code, developer_id="alice", file_uri="file:///demo.py")
+            )
+            self.assertEqual("success", clean_result.status)
+            self.assertEqual(100, clean_result.scores["security"])
+            self.assertGreater(clean_result.diff["score_delta"], 0)
+            self.assertEqual(1, clean_result.diff["fixed_count"])
+            self.assertEqual(2, len(repository.list_analysis_events("alice", "file:///demo.py")))
+
+            repeat_result = clean_service.analyze(
+                AnalysisRequest(code=clean_code, developer_id="alice", file_uri="file:///demo.py")
+            )
+            self.assertEqual(clean_result.event_id, repeat_result.event_id)
+            self.assertEqual(2, len(repository.list_analysis_events("alice", "file:///demo.py")))
+            self.assertNotEqual(insecure_result.event_id, clean_result.event_id)
+
+    def test_missing_file_uri_skips_event_persistence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service, repo = build_service(
+                Path(tmpdir),
+                responses={
+                    "planning": {
+                        "intent": "Print a value.",
+                        "entry_points": [],
+                        "sensitive_operations": [],
+                        "security_focus": [],
+                    },
+                    "coding": {
+                        "vuln_found": False,
+                        "vuln_type": "",
+                        "vulnerable_line": "",
+                        "pattern": "",
+                        "attack_scenario": "",
+                        "suggested_fix": "",
+                        "confidence": 0.0,
+                    },
+                },
+            )
+            result = service.analyze(AnalysisRequest(code="print('hi')", developer_id="alice"))
+            self.assertEqual("", result.event_id)
+            self.assertEqual([], repo.list_analysis_events("alice"))
 
     def test_custom_registered_agent_runs_without_service_changes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -588,6 +852,127 @@ class TransportTests(unittest.TestCase):
             names = __import__("asyncio").run(list_registered())
             self.assertIn("ping", names)
             self.assertIn("analyze_code", names)
+
+    def test_http_dashboard_timeline_and_file_state_endpoints(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service, repo = build_service(
+                Path(tmpdir),
+                responses={
+                    "planning": {
+                        "intent": "Query user data.",
+                        "entry_points": ["user_id"],
+                        "sensitive_operations": ["db.execute"],
+                        "security_focus": ["SQL Injection"],
+                    },
+                    "coding": {
+                        "vuln_found": True,
+                        "vuln_type": "SQL Injection",
+                        "vulnerable_line": 'query = "SELECT * FROM users WHERE id=" + user_id',
+                        "pattern": "User input is concatenated into SQL.",
+                        "attack_scenario": "Attacker can inject SQL.",
+                        "suggested_fix": "Use parameterized queries.",
+                        "confidence": 0.92,
+                    },
+                    "security": {
+                        "severity": "CRITICAL",
+                        "owasp_category": "A03:2021 - Injection",
+                        "cve_reference": "GENERIC",
+                        "data_flow": "user input flows into db.execute",
+                        "developer_note": "Use bound parameters.",
+                        "full_explanation": "String concatenation turns data into executable SQL.",
+                    },
+                },
+            )
+            service.analyze(
+                AnalysisRequest(
+                    code='query = "SELECT * FROM users WHERE id=" + user_id',
+                    developer_id="alice",
+                    file_uri="file:///demo.py",
+                )
+            )
+            app = create_app()
+            app.config["TESTING"] = True
+            client = app.test_client()
+            import appsec_agent.http_server as http_server
+
+            http_server.get_analysis_service = lambda: service
+            http_server.get_repository = lambda: repo
+
+            dashboard = client.get("/dashboard", query_string={"developer_id": "alice"}).get_json()
+            timeline = client.get("/timeline", query_string={"developer_id": "alice", "file_uri": "file:///demo.py"}).get_json()
+            file_state = client.get(
+                "/file-state",
+                query_string={"developer_id": "alice", "file_uri": "file:///demo.py"},
+            ).get_json()
+
+            self.assertEqual(1, dashboard["total_files"])
+            self.assertEqual(1, len(timeline))
+            self.assertEqual("file:///demo.py", file_state["file_uri"])
+            self.assertEqual("CRITICAL", file_state["findings"][0]["severity"])
+
+    def test_mcp_dashboard_tools_share_backend_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service, repo = build_service(
+                Path(tmpdir),
+                responses={
+                    "planning": {
+                        "intent": "Query user data.",
+                        "entry_points": ["user_id"],
+                        "sensitive_operations": ["db.execute"],
+                        "security_focus": ["SQL Injection"],
+                    },
+                    "coding": {
+                        "vuln_found": True,
+                        "vuln_type": "SQL Injection",
+                        "vulnerable_line": 'query = "SELECT * FROM users WHERE id=" + user_id',
+                        "pattern": "User input is concatenated into SQL.",
+                        "attack_scenario": "Attacker can inject SQL.",
+                        "suggested_fix": "Use parameterized queries.",
+                        "confidence": 0.92,
+                    },
+                    "security": {
+                        "severity": "CRITICAL",
+                        "owasp_category": "A03:2021 - Injection",
+                        "cve_reference": "GENERIC",
+                        "data_flow": "user input flows into db.execute",
+                        "developer_note": "Use bound parameters.",
+                        "full_explanation": "String concatenation turns data into executable SQL.",
+                    },
+                },
+            )
+            service.analyze(
+                AnalysisRequest(
+                    code='query = "SELECT * FROM users WHERE id=" + user_id',
+                    developer_id="alice",
+                    file_uri="file:///demo.py",
+                    source="mcp_agent",
+                )
+            )
+            import appsec_agent.server as mcp_server
+
+            mcp_server.get_analysis_service = lambda: service
+            mcp_server.get_repository = lambda: repo
+
+            async def invoke_dashboard():
+                dashboard = await call_tool("get_dashboard", {"developer_id": "alice"})
+                timeline = await call_tool(
+                    "get_analysis_timeline",
+                    {"developer_id": "alice", "file_uri": "file:///demo.py"},
+                )
+                file_state = await call_tool(
+                    "get_file_state",
+                    {"developer_id": "alice", "file_uri": "file:///demo.py"},
+                )
+                return (
+                    json.loads(dashboard[0].text),
+                    json.loads(timeline[0].text),
+                    json.loads(file_state[0].text),
+                )
+
+            dashboard_payload, timeline_payload, file_state_payload = __import__("asyncio").run(invoke_dashboard())
+            self.assertEqual(1, dashboard_payload["total_files"])
+            self.assertEqual("mcp_agent", timeline_payload[0]["source"])
+            self.assertEqual("file:///demo.py", file_state_payload["file_uri"])
 
 
 if __name__ == "__main__":
